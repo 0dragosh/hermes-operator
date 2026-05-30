@@ -51,6 +51,7 @@ func BuildBackupOneShotJob(inst *hermesv1.HermesInstance, opts BackupJobOpts) *b
 					SchedulerName:                 "default-scheduler",
 					TerminationGracePeriodSeconds: Ptr(int64(30)),
 					AutomountServiceAccountToken:  Ptr(false),
+					Affinity:                      backupPodAffinity(inst),
 					SecurityContext: &corev1.PodSecurityContext{
 						RunAsNonRoot: Ptr(true),
 						RunAsUser:    Ptr(int64(1000)),
@@ -73,7 +74,7 @@ func BuildBackupOneShotJob(inst *hermesv1.HermesInstance, opts BackupJobOpts) *b
 							corev1.EnvVar{Name: "SNAPSHOT_KEY", Value: opts.SnapshotKey},
 						),
 						VolumeMounts: []corev1.VolumeMount{
-							{Name: "data", MountPath: "/home/hermes/.hermes"},
+							{Name: "data", MountPath: "/home/hermes/.hermes", ReadOnly: true},
 							{Name: "tmp", MountPath: "/tmp"},
 						},
 						SecurityContext: &corev1.SecurityContext{
@@ -88,6 +89,7 @@ func BuildBackupOneShotJob(inst *hermesv1.HermesInstance, opts BackupJobOpts) *b
 							VolumeSource: corev1.VolumeSource{
 								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 									ClaimName: PVCName(inst),
+									ReadOnly:  true,
 								},
 							},
 						},

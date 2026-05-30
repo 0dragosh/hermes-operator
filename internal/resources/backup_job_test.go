@@ -91,6 +91,25 @@ func TestBuildBackupOneShotJob_PVCRef(t *testing.T) {
 	require.NotNil(t, data)
 	require.NotNil(t, data.PersistentVolumeClaim)
 	assert.Equal(t, PVCName(inst), data.PersistentVolumeClaim.ClaimName)
+	assert.True(t, data.PersistentVolumeClaim.ReadOnly)
+	assert.True(t, job.Spec.Template.Spec.Containers[0].VolumeMounts[0].ReadOnly)
+}
+
+func TestBuildBackupOneShotJob_CoLocatesWithInstancePodForRWOPVC(t *testing.T) {
+	inst := backupInstance()
+	job := BuildBackupOneShotJob(inst, BackupJobOpts{Name: "demo-backup-final", SnapshotKey: "k", Kind: "onDelete"})
+	affinity := job.Spec.Template.Spec.Affinity
+	require.NotNil(t, affinity)
+	require.NotNil(t, affinity.PodAffinity)
+	require.Len(t, affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution, 1)
+
+	term := affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution[0]
+	assert.Equal(t, "kubernetes.io/hostname", term.TopologyKey)
+	require.NotNil(t, term.LabelSelector)
+	assert.Equal(t, map[string]string{
+		"app.kubernetes.io/name":     "hermes-agent",
+		"app.kubernetes.io/instance": "demo",
+	}, term.LabelSelector.MatchLabels)
 }
 
 func TestBuildBackupOneShotJob_S3CredsViaExplicitSecretKeyRefs(t *testing.T) {

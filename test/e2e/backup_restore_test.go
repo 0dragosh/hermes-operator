@@ -58,8 +58,11 @@ spec:
 			return strings.TrimSpace(out)
 		}, 3*time.Minute).Should(Equal("1"))
 
-		snapshotKey := findFirstSnapshotKey(ns, "e2e-br")
-		Expect(snapshotKey).NotTo(BeEmpty(), "expected at least one snapshot in the bucket")
+		var snapshotKey string
+		Eventually(func() string {
+			snapshotKey = findFirstSnapshotKey(ns, "e2e-br")
+			return snapshotKey
+		}, time.Minute, 2*time.Second).ShouldNot(BeEmpty(), "expected at least one snapshot in the bucket")
 		Expect(snapshotKey).To(HavePrefix("e2e/" + ns + "/e2e-br/"))
 		Expect(snapshotKey).To(HaveSuffix(".tar.zst"))
 		GinkgoWriter.Printf("found scheduled snapshot: %s\n", snapshotKey)
@@ -115,7 +118,9 @@ spec:
 // findFirstSnapshotKey lists the bucket prefix and returns the first key, or "" if nothing.
 func findFirstSnapshotKey(namespace, instance string) string {
 	prefix := "e2e/" + namespace + "/" + instance + "/"
-	for _, key := range listHermesBackupKeys(prefix) {
+	keys, err := listHermesBackupKeys(prefix)
+	Expect(err).NotTo(HaveOccurred(), "list backup keys for prefix %q", prefix)
+	for _, key := range keys {
 		if strings.HasSuffix(key, ".tar.zst") {
 			return key
 		}
@@ -124,7 +129,8 @@ func findFirstSnapshotKey(namespace, instance string) string {
 }
 
 func expectNoResticRepositoryLayout() {
-	keys := listHermesBackupKeys("")
+	keys, err := listHermesBackupKeys("")
+	Expect(err).NotTo(HaveOccurred(), "list backup keys for repository layout check")
 	for _, disallowed := range []string{"config", "data/", "index/", "snapshots/"} {
 		for _, key := range keys {
 			Expect(key).NotTo(HavePrefix(disallowed), "legacy repository layout should not be present in raw backup bucket")
@@ -132,27 +138,34 @@ func expectNoResticRepositoryLayout() {
 	}
 }
 
-func listHermesBackupKeys(prefix string) []string {
+func listHermesBackupKeys(prefix string) ([]string, error) {
 	cfg := e2eConfigFromEnv()
 	cmd := []string{
 		"run", "mc-list", "--namespace", cfg.WorkloadNamespace, "--rm", "-i", "--restart=Never",
 		"--image=minio/mc:RELEASE.2024-09-16T17-43-14Z",
 		"--env=MINIO_ENDPOINT=" + cfg.MinIOEndpoint(),
 		"--env=BACKUP_PREFIX=" + prefix,
-		"--", "/bin/sh", "-c",
-		`mc alias set local "$MINIO_ENDPOINT" minioadmin minioadmin >/dev/null 2>&1 && mc ls --recursive "local/hermes-backups/${BACKUP_PREFIX}" | awk '{print $NF}'`,
+		"--command", "--", "/bin/sh", "-c",
+		`mc alias set local "$MINIO_ENDPOINT" minioadmin minioadmin >/dev/null 2>&1 && mc ls --recursive "local/hermes-backups/${BACKUP_PREFIX}"`,
 	}
 	out, err := kubectl(cmd...)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("kubectl %s failed: %w\n%s", strings.Join(cmd, " "), err, out)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	keys := make([]string, 0, len(lines))
 	for _, line := range lines {
-		key := strings.TrimSpace(line)
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		key := fields[len(fields)-1]
+		if prefix != "" && !strings.HasPrefix(key, prefix) {
+			key = prefix + strings.TrimLeft(key, "/")
+		}
 		if key != "" {
 			keys = append(keys, key)
 		}
 	}
-	return keys
+	return keys, nil
 }

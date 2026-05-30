@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -93,6 +94,10 @@ spec:
 })
 
 var _ = AfterSuite(func() {
+	if strings.EqualFold(os.Getenv("HERMES_E2E_SKIP_CLEANUP"), "true") || os.Getenv("HERMES_E2E_SKIP_CLEANUP") == "1" {
+		GinkgoWriter.Println("HERMES_E2E_SKIP_CLEANUP is set; leaving e2e resources in place")
+		return
+	}
 	cleanupE2EResources(e2eConfigFromEnv())
 })
 

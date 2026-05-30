@@ -69,7 +69,9 @@ func TestBuildRestoreInitContainer_EmptyDestinationGuardRemains(t *testing.T) {
 	c := BuildRestoreInitContainer(restoreInstance())
 	joined := strings.Join(c.Args, " ")
 	assert.Contains(t, joined, `DEST=/home/hermes/.hermes`)
-	assert.Contains(t, joined, `[ -n "$(ls -A "$DEST" 2>/dev/null)" ]`)
+	assert.Contains(t, joined, `HAS_RESTORE_CONTENTS=false`)
+	assert.Contains(t, joined, `lost+found) continue ;;`)
+	assert.Contains(t, joined, `[ "$HAS_RESTORE_CONTENTS" = true ]`)
 	assert.Contains(t, joined, `HERMES_RESTORE_FORCE`)
 	assert.Contains(t, joined, "refusing to overwrite")
 }

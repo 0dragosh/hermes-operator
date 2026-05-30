@@ -117,21 +117,7 @@ func BuildBackupCronJob(inst *hermesv1.HermesInstance) *batchv1.CronJob {
 				Type: corev1.SeccompProfileTypeRuntimeDefault,
 			},
 		},
-		// Co-locate on the same node as the StatefulSet pod so we can mount
-		// the RWO PVC read-only.
-		Affinity: &corev1.Affinity{
-			PodAffinity: &corev1.PodAffinity{
-				RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
-					LabelSelector: &metav1.LabelSelector{
-						MatchLabels: map[string]string{
-							"app.kubernetes.io/name":     "hermes-agent",
-							"app.kubernetes.io/instance": inst.Name,
-						},
-					},
-					TopologyKey: "kubernetes.io/hostname",
-				}},
-			},
-		},
+		Affinity: backupPodAffinity(inst),
 		Containers: []corev1.Container{{
 			Name:                     "backup",
 			Image:                    image,
@@ -195,6 +181,24 @@ func BuildBackupCronJob(inst *hermesv1.HermesInstance) *batchv1.CronJob {
 					},
 				},
 			},
+		},
+	}
+}
+
+// backupPodAffinity co-locates backup pods with the agent StatefulSet pod so
+// read/write-once PVCs can be mounted for both scheduled and one-shot backups.
+func backupPodAffinity(inst *hermesv1.HermesInstance) *corev1.Affinity {
+	return &corev1.Affinity{
+		PodAffinity: &corev1.PodAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"app.kubernetes.io/name":     "hermes-agent",
+						"app.kubernetes.io/instance": inst.Name,
+					},
+				},
+				TopologyKey: "kubernetes.io/hostname",
+			}},
 		},
 	}
 }

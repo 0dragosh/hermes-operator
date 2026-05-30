@@ -8,7 +8,16 @@ import (
 
 const restoreFromS3Script = `set -euo pipefail
 DEST=/home/hermes/.hermes
-if [ -n "$(ls -A "$DEST" 2>/dev/null)" ] && [ -z "${HERMES_RESTORE_FORCE:-}" ]; then
+HAS_RESTORE_CONTENTS=false
+for entry in "$DEST"/* "$DEST"/.[!.]* "$DEST"/..?*; do
+  [ -e "$entry" ] || continue
+  case "$(basename "$entry")" in
+    lost+found) continue ;;
+  esac
+  HAS_RESTORE_CONTENTS=true
+  break
+done
+if [ "$HAS_RESTORE_CONTENTS" = true ] && [ -z "${HERMES_RESTORE_FORCE:-}" ]; then
   echo "ERROR: restore destination $DEST is not empty; refusing to overwrite. Set HERMES_RESTORE_FORCE=1 to override." >&2
   exit 1
 fi
