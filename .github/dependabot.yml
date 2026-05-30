@@ -36,3 +36,12 @@ updates:
     labels:
       - dependencies
       - docker
+
+  - package-ecosystem: docker
+    directory: "/images/hermes-agent"
+    schedule:
+      interval: weekly
+      day: monday
+    labels:
+      - dependencies
+      - docker

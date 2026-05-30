@@ -13,13 +13,13 @@ jobs:
     steps:
       # Mint a short-lived token (~1h) from the paperclip-release-bot App.
       # Avoids long-lived PATs that the paperclipinc org policy blocks.
-      - uses: actions/create-github-app-token@v1
+      - uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547
         id: app-token
         with:
           app-id: ${{ vars.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
 
-      - uses: googleapis/release-please-action@v4
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071
         id: release
         with:
           token: ${{ steps.app-token.outputs.token }}
@@ -57,6 +57,55 @@ jobs:
 
           if [[ -n "$VERSION" ]]; then
             TAG="v${VERSION}"
+            CSV="bundle/manifests/hermes-operator.clusterserviceversion.yaml"
+            EXPECTED_NAME="hermes-operator.v${VERSION}"
+            EXPECTED_IMAGE="ghcr.io/paperclipinc/hermes-operator:${TAG}"
+
+            strip_yaml_scalar() {
+              local value="$1"
+              value="${value#"${value%%[![:space:]]*}"}"
+              value="${value%"${value##*[![:space:]]}"}"
+              value="${value%\"}"
+              value="${value#\"}"
+              value="${value%\'}"
+              value="${value#\'}"
+              printf '%s' "$value"
+            }
+
+            ACTUAL_NAME=$(awk '
+              /^metadata:/ { in_metadata=1; next }
+              in_metadata && /^spec:/ { in_metadata=0 }
+              in_metadata && /^  name:/ { sub(/^[^:]+:[[:space:]]*/, ""); print; exit }
+            ' "$CSV")
+            ACTUAL_IMAGE=$(awk '
+              /^[[:space:]]+containerImage:/ { sub(/^[^:]+:[[:space:]]*/, ""); print; exit }
+            ' "$CSV")
+            ACTUAL_VERSION=$(awk '
+              /^spec:/ { in_spec=1; next }
+              in_spec && /^  version:/ { sub(/^[^:]+:[[:space:]]*/, ""); print; exit }
+            ' "$CSV")
+
+            ACTUAL_NAME=$(strip_yaml_scalar "$ACTUAL_NAME")
+            ACTUAL_IMAGE=$(strip_yaml_scalar "$ACTUAL_IMAGE")
+            ACTUAL_VERSION=$(strip_yaml_scalar "$ACTUAL_VERSION")
+
+            BUNDLE_OK=true
+            if [[ "$ACTUAL_NAME" != "$EXPECTED_NAME" ]]; then
+              echo "::error::${CSV} metadata.name is '${ACTUAL_NAME}', expected '${EXPECTED_NAME}'"
+              BUNDLE_OK=false
+            fi
+            if [[ "$ACTUAL_IMAGE" != "$EXPECTED_IMAGE" ]]; then
+              echo "::error::${CSV} metadata.annotations.containerImage is '${ACTUAL_IMAGE}', expected '${EXPECTED_IMAGE}'"
+              BUNDLE_OK=false
+            fi
+            if [[ "$ACTUAL_VERSION" != "$VERSION" ]]; then
+              echo "::error::${CSV} spec.version is '${ACTUAL_VERSION}', expected '${VERSION}'"
+              BUNDLE_OK=false
+            fi
+            if [[ "$BUNDLE_OK" != true ]]; then
+              echo "::error::Refusing to create ${TAG}; release bundle fields are not versioned correctly."
+              exit 1
+            fi
 
             # Only create if tag doesn't already exist
             if gh api "repos/${{ github.repository }}/git/refs/tags/${TAG}" &>/dev/null; then

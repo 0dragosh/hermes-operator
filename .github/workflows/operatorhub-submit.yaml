@@ -10,8 +10,8 @@ on:
         required: true
 
 jobs:
-  submit-community-operators:
-    name: Submit to k8s-operatorhub/community-operators
+  validate-release-gates:
+    name: Validate OperatorHub release gates
     runs-on: ubuntu-latest
     steps:
       - name: Resolve tag
@@ -22,7 +22,79 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ steps.version.outputs.tag }}
+
+      - name: Validate bundle release fields
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="${{ steps.version.outputs.tag }}"
+          CSV="bundle/manifests/hermes-operator.clusterserviceversion.yaml"
+          EXPECTED_NAME="hermes-operator.v${VERSION}"
+          EXPECTED_IMAGE="ghcr.io/paperclipinc/hermes-operator:${TAG}"
+
+          strip_yaml_scalar() {
+            local value="$1"
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+            value="${value%\"}"
+            value="${value#\"}"
+            value="${value%\'}"
+            value="${value#\'}"
+            printf '%s' "$value"
+          }
+
+          ACTUAL_NAME=$(awk '
+            /^metadata:/ { in_metadata=1; next }
+            in_metadata && /^spec:/ { in_metadata=0 }
+            in_metadata && /^  name:/ { sub(/^[^:]+:[[:space:]]*/, ""); print; exit }
+          ' "$CSV")
+          ACTUAL_IMAGE=$(awk '
+            /^[[:space:]]+containerImage:/ { sub(/^[^:]+:[[:space:]]*/, ""); print; exit }
+          ' "$CSV")
+          ACTUAL_VERSION=$(awk '
+            /^spec:/ { in_spec=1; next }
+            in_spec && /^  version:/ { sub(/^[^:]+:[[:space:]]*/, ""); print; exit }
+          ' "$CSV")
+
+          ACTUAL_NAME=$(strip_yaml_scalar "$ACTUAL_NAME")
+          ACTUAL_IMAGE=$(strip_yaml_scalar "$ACTUAL_IMAGE")
+          ACTUAL_VERSION=$(strip_yaml_scalar "$ACTUAL_VERSION")
+
+          BUNDLE_OK=true
+          if [[ "$ACTUAL_NAME" != "$EXPECTED_NAME" ]]; then
+            echo "::error::${CSV} metadata.name is '${ACTUAL_NAME}', expected '${EXPECTED_NAME}'"
+            BUNDLE_OK=false
+          fi
+          if [[ "$ACTUAL_IMAGE" != "$EXPECTED_IMAGE" ]]; then
+            echo "::error::${CSV} metadata.annotations.containerImage is '${ACTUAL_IMAGE}', expected '${EXPECTED_IMAGE}'"
+            BUNDLE_OK=false
+          fi
+          if [[ "$ACTUAL_VERSION" != "$VERSION" ]]; then
+            echo "::error::${CSV} spec.version is '${ACTUAL_VERSION}', expected '${VERSION}'"
+            BUNDLE_OK=false
+          fi
+          if [[ "$BUNDLE_OK" != true ]]; then
+            echo "::error::Refusing OperatorHub submission; release bundle fields are not versioned correctly."
+            exit 1
+          fi
+
+  submit-community-operators:
+    name: Submit to k8s-operatorhub/community-operators
+    runs-on: ubuntu-latest
+    needs: validate-release-gates
+    steps:
+      - name: Resolve tag
+        id: version
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           ref: ${{ steps.version.outputs.tag }}
 
@@ -34,14 +106,8 @@ jobs:
           BUNDLE_DIR="submission/operators/hermes-operator/${VERSION}"
           mkdir -p "${BUNDLE_DIR}/manifests" "${BUNDLE_DIR}/metadata"
 
-          # Copy and version the CSV.
-          sed \
-            -e "s/hermes-operator\.v[0-9]\+\.[0-9]\+\.[0-9]\+/hermes-operator.v${VERSION}/g" \
-            -e "s|ghcr.io/paperclipinc/hermes-operator:v[0-9]\+\.[0-9]\+\.[0-9]\+|ghcr.io/paperclipinc/hermes-operator:${TAG}|g" \
-            -e "s/createdAt: .*/createdAt: \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"/" \
-            -e "s/^  version: [0-9]\+\.[0-9]\+\.[0-9]\+/  version: ${VERSION}/" \
-            bundle/manifests/hermes-operator.clusterserviceversion.yaml \
-            > "${BUNDLE_DIR}/manifests/hermes-operator.v${VERSION}.clusterserviceversion.yaml"
+          cp bundle/manifests/hermes-operator.clusterserviceversion.yaml \
+            "${BUNDLE_DIR}/manifests/hermes-operator.v${VERSION}.clusterserviceversion.yaml"
 
           # CRDs and metadata as-is.
           cp bundle/manifests/hermes.agent_hermesinstances.yaml      "${BUNDLE_DIR}/manifests/"
@@ -111,6 +177,7 @@ jobs:
   submit-redhat:
     name: Submit to redhat-openshift-ecosystem/community-operators-prod
     runs-on: ubuntu-latest
+    needs: validate-release-gates
     steps:
       - name: Resolve tag
         id: version
@@ -120,7 +187,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           ref: ${{ steps.version.outputs.tag }}
 
@@ -131,13 +198,8 @@ jobs:
           TAG="${{ steps.version.outputs.tag }}"
           BUNDLE_DIR="submission/operators/hermes-operator/${VERSION}"
           mkdir -p "${BUNDLE_DIR}/manifests" "${BUNDLE_DIR}/metadata"
-          sed \
-            -e "s/hermes-operator\.v[0-9]\+\.[0-9]\+\.[0-9]\+/hermes-operator.v${VERSION}/g" \
-            -e "s|ghcr.io/paperclipinc/hermes-operator:v[0-9]\+\.[0-9]\+\.[0-9]\+|ghcr.io/paperclipinc/hermes-operator:${TAG}|g" \
-            -e "s/createdAt: .*/createdAt: \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"/" \
-            -e "s/^  version: [0-9]\+\.[0-9]\+\.[0-9]\+/  version: ${VERSION}/" \
-            bundle/manifests/hermes-operator.clusterserviceversion.yaml \
-            > "${BUNDLE_DIR}/manifests/hermes-operator.v${VERSION}.clusterserviceversion.yaml"
+          cp bundle/manifests/hermes-operator.clusterserviceversion.yaml \
+            "${BUNDLE_DIR}/manifests/hermes-operator.v${VERSION}.clusterserviceversion.yaml"
           cp bundle/manifests/hermes.agent_hermesinstances.yaml      "${BUNDLE_DIR}/manifests/"
           cp bundle/manifests/hermes.agent_hermesselfconfigs.yaml    "${BUNDLE_DIR}/manifests/"
           cp bundle/manifests/hermes.agent_hermesclusterdefaults.yaml "${BUNDLE_DIR}/manifests/"

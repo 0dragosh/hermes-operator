@@ -3,13 +3,45 @@ name: Conformance
 on:
   schedule:
     - cron: '0 4 * * *'    # 04:00 UTC nightly
+  workflow_call:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
+    paths:
+      - 'api/v1/**'
+      - 'internal/controller/**'
+      - 'internal/resources/**'
+      - 'internal/webhook/**'
+      - 'cmd/**'
+      - 'config/**'
+      - 'charts/**'
+      - 'bundle/**'
+      - 'test/conformance/**'
+      - 'hack/kind-config.yaml'
+      - 'Makefile'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/conformance.yaml'
+      - '.github/workflows/release.yaml'
   pull_request:
     paths:
+      - 'api/v1/**'
+      - 'internal/controller/**'
+      - 'internal/resources/**'
+      - 'internal/webhook/**'
+      - 'cmd/**'
+      - 'config/**'
+      - 'charts/**'
+      - 'bundle/**'
       - 'test/conformance/**'
+      - 'hack/kind-config.yaml'
+      - 'Makefile'
+      - 'go.mod'
+      - 'go.sum'
       - '.github/workflows/conformance.yaml'
+      - '.github/workflows/release.yaml'
   workflow_dispatch:
 
 jobs:
@@ -18,14 +50,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
         with: { go-version-file: go.mod }
-      - uses: helm/kind-action@v1
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc
         with:
           cluster_name: hermes-conformance
           config: hack/kind-config.yaml
-      - uses: azure/setup-helm@v5
+      - uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2
       - name: Install cert-manager
         run: |
           helm repo add jetstack https://charts.jetstack.io
@@ -43,14 +75,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
         with: { go-version-file: go.mod }
-      - uses: helm/kind-action@v1
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc
         with:
           cluster_name: hermes-conformance
           config: hack/kind-config.yaml
-      - uses: azure/setup-helm@v5
+      - uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2
       - name: Install cert-manager
         run: |
           helm repo add jetstack https://charts.jetstack.io
@@ -68,10 +100,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
         with: { go-version-file: go.mod }
-      - uses: azure/setup-helm@v5
+      - uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2
       - env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: make conformance-upgrade
@@ -81,14 +113,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
         with: { go-version-file: go.mod }
-      - uses: helm/kind-action@v1
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc
         with:
           cluster_name: hermes-conformance
           config: hack/kind-config.yaml
-      - uses: azure/setup-helm@v5
+      - uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2
       - name: Install cert-manager
         run: |
           helm repo add jetstack https://charts.jetstack.io
@@ -106,14 +138,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
         with: { go-version-file: go.mod }
-      - uses: helm/kind-action@v1
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc
         with:
           cluster_name: hermes-conformance
           config: hack/kind-config.yaml
-      - uses: azure/setup-helm@v5
+      - uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2
       - name: Install cert-manager
         run: |
           helm repo add jetstack https://charts.jetstack.io
@@ -131,6 +163,6 @@ jobs:
     name: Conformance gate
     needs: [negative, idempotency, upgrade, gitops, failure-injection]
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_call' || startsWith(github.ref, 'refs/tags/v')
     steps:
       - run: echo "All conformance jobs passed."
