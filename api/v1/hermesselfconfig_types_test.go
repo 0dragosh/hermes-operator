@@ -1,9 +1,11 @@
 package v1
 
 import (
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -34,10 +36,10 @@ func TestHermesSelfConfig_AllMutationFields(t *testing.T) {
 				Raw: []byte(`{"schedules":{"morning-brief":"0 8 * * *"}}`),
 			},
 			AddEnvVars: []SelfConfigEnvVar{
-				{Name: "FINANCE_TZ", Value: "Europe/Berlin"},
+				{Name: "FINANCE_TZ", Value: Ptr("Europe/Berlin")},
 			},
 			AddWorkspaceFiles: []SelfConfigWorkspaceFile{
-				{Path: "notes/finance.md", Content: "# Finance notes"},
+				{Path: "notes/finance.md", Content: Ptr("# Finance notes")},
 			},
 			AddProfileSnapshot: &SelfConfigProfileSnapshot{
 				ProfileID: "user-42",
@@ -47,9 +49,18 @@ func TestHermesSelfConfig_AllMutationFields(t *testing.T) {
 	}
 	assert.NotNil(t, sc.Spec.PatchConfig)
 	assert.JSONEq(t, `{"schedules":{"morning-brief":"0 8 * * *"}}`, string(sc.Spec.PatchConfig.Raw))
-	assert.Equal(t, "Europe/Berlin", sc.Spec.AddEnvVars[0].Value)
+	require.NotNil(t, sc.Spec.AddEnvVars[0].Value)
+	assert.Equal(t, "Europe/Berlin", *sc.Spec.AddEnvVars[0].Value)
 	assert.Equal(t, "notes/finance.md", sc.Spec.AddWorkspaceFiles[0].Path)
 	assert.Equal(t, "user-42", sc.Spec.AddProfileSnapshot.ProfileID)
+}
+
+func TestHermesSelfConfig_ProfileIDValidationMarkers(t *testing.T) {
+	t.Parallel()
+	body, err := os.ReadFile("hermesselfconfig_types.go")
+	require.NoError(t, err)
+
+	assert.Contains(t, string(body), "// +kubebuilder:validation:MinLength=1\n\t// +kubebuilder:validation:MaxLength=253\n\t// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`\n\tProfileID string `json:\"profileID\"`")
 }
 
 func TestHermesSelfConfig_StatusShape(t *testing.T) {

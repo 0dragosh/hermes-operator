@@ -26,7 +26,7 @@ func TestHermesClusterDefaults_Shape(t *testing.T) {
 				},
 			},
 			Networking: NetworkingDefaults{
-				NetworkPolicy: NetworkPolicyDefaults{Enabled: Ptr(true)},
+				NetworkPolicy: NetworkPolicyDefaults{Enabled: Ptr(true), AllowSameNamespaceIngress: Ptr(false)},
 			},
 			Observability: ObservabilityDefaults{
 				ServiceMonitor: ServiceMonitorSpec{Enabled: Ptr(true)},
@@ -37,6 +37,7 @@ func TestHermesClusterDefaults_Shape(t *testing.T) {
 	assert.Equal(t, "ghcr.io/paperclipinc/hermes-agent", hcd.Spec.Image.Repository)
 	assert.Equal(t, "ghcr-pull", hcd.Spec.Registry.PullSecretName)
 	assert.NotNil(t, hcd.Spec.Storage.Persistence.StorageClassName)
+	assert.False(t, *hcd.Spec.Networking.NetworkPolicy.AllowSameNamespaceIngress)
 
 	// Sanity: a non-cluster name should still parse: the *webhook* rejects it,
 	// not the type system.

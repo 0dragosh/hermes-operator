@@ -17,6 +17,8 @@ limitations under the License.
 package v1
 
 import (
+	"regexp"
+
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -24,6 +26,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	intstr "k8s.io/apimachinery/pkg/util/intstr"
 )
+
+const (
+	DefaultAgentImageRepository = "ghcr.io/paperclipinc/hermes-agent"
+	DefaultAgentImageTag        = "v2026.5.29.2"
+)
+
+var imageRepositoryDigestRE = regexp.MustCompile(`@sha256:[a-f0-9]{64}$`)
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
@@ -82,8 +91,8 @@ type HermesInstanceSpec struct {
 	// +optional
 	InitContainers []corev1.Container `json:"initContainers,omitempty"`
 
-	// Sidecars is a user-supplied list of sidecars appended after operator-managed
-	// sidecars (e.g. ollama / web-terminal / tailscale from Plan 3).
+	// Sidecars is a user-supplied list of sidecars appended after
+	// operator-managed sidecars.
 	// +optional
 	Sidecars []corev1.Container `json:"sidecars,omitempty"`
 
@@ -160,11 +169,11 @@ type HermesInstanceSpec struct {
 
 // ImageSpec selects an OCI image.
 type ImageSpec struct {
-	// +kubebuilder:default="ghcr.io/paperclipinc/hermes-agent"
 	// +optional
 	Repository string `json:"repository,omitempty"`
 
-	// +kubebuilder:default="latest"
+	// Tag must be a concrete tag and must not be "latest" unless the image
+	// repository is pinned by digest.
 	// +optional
 	Tag string `json:"tag,omitempty"`
 
@@ -172,6 +181,10 @@ type ImageSpec struct {
 	// +kubebuilder:validation:Enum=Always;IfNotPresent;Never
 	// +optional
 	PullPolicy string `json:"pullPolicy,omitempty"`
+}
+
+func ImageRepositoryUsesDigest(repository string) bool {
+	return imageRepositoryDigestRE.MatchString(repository)
 }
 
 // StorageSpec controls the PVC backing the agent's data directory.
@@ -232,10 +245,10 @@ type RawConfig struct {
 }
 
 // WorkspaceSpec seeds initial files and directories into ~/.hermes on first
-// start. Path values support arbitrary nested directories ("a/b/c.md" is fine);
-// the workspace ConfigMap encodes nested paths using "__" as the separator so a
-// single-level ConfigMap data map can express them: Plan 3's runtime-init
-// container decodes the keys back to filesystem paths before invoking the agent.
+// start. Path values support nested directories ("a/b/c.md" is fine); the
+// workspace ConfigMap escapes separators into a single-level data map and
+// runtime-init decodes the keys back to filesystem paths before invoking the
+// agent.
 //
 // Lesson from openclaw #482: do not constrain Path to a single segment; that
 // caused users to flatten their notes into hash-separated filenames.
@@ -264,13 +277,12 @@ type WorkspaceSpec struct {
 	Bootstrap WorkspaceBootstrap `json:"bootstrap,omitempty"`
 }
 
-// WorkspaceFile is a single seeded file. Nested paths are allowed; the workspace
-// ConfigMap encodes them with "__" separators (decoded by runtime-init).
+// WorkspaceFile is a single seeded file. Nested paths are allowed.
 type WorkspaceFile struct {
 	// Path is the relative path under ~/.hermes (e.g. "notes/finance/2026.md").
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=4096
-	// +kubebuilder:validation:Pattern=`^[^/].*[^/]$|^[^/]$`
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$`
 	Path string `json:"path"`
 
 	// Content is the UTF-8 body. Binary content must be base64-encoded by the
@@ -363,21 +375,29 @@ type RBACSpec struct {
 // NetworkPolicySpec controls per-instance NetworkPolicy creation.
 type NetworkPolicySpec struct {
 	// Enabled: when true (the default), the operator creates a deny-all
-	// NetworkPolicy plus selective allow rules (DNS + 443 egress + Service ingress
-	// from the same namespace).
+	// NetworkPolicy plus selective allow rules. By default this only emits DNS
+	// egress; ingress sources and non-DNS egress destinations must be configured
+	// explicitly.
 	// +kubebuilder:default=true
 	// +optional
 	Enabled *bool `json:"enabled,omitempty"`
 
 	// AllowDNS: emit the standard DNS egress rule (UDP+TCP 53 to any peer).
-	// Default true. Disable only when CoreDNS is reachable via a different
-	// transport (e.g. node-local DNS via hostNetwork).
+	// Kubernetes NetworkPolicy cannot portably target CoreDNS without
+	// cluster-specific selectors. Strict installs can set this false and supply
+	// DNS egress through AdditionalEgress.
 	// +kubebuilder:default=true
 	// +optional
 	AllowDNS *bool `json:"allowDNS,omitempty"`
 
-	// AllowedIngressNamespaces is the set of additional namespaces (beyond the
-	// instance's own) whose pods may connect to the agent's exposed ports.
+	// AllowSameNamespaceIngress allows pods from the instance namespace to
+	// connect to the agent's exposed ports.
+	// +kubebuilder:default=false
+	// +optional
+	AllowSameNamespaceIngress *bool `json:"allowSameNamespaceIngress,omitempty"`
+
+	// AllowedIngressNamespaces is the set of namespaces whose pods may connect
+	// to the agent's exposed ports.
 	// +listType=set
 	// +optional
 	AllowedIngressNamespaces []string `json:"allowedIngressNamespaces,omitempty"`
@@ -388,8 +408,8 @@ type NetworkPolicySpec struct {
 	// +optional
 	AllowedIngressCIDRs []string `json:"allowedIngressCIDRs,omitempty"`
 
-	// AllowedEgressCIDRs is the set of CIDRs the agent may connect to in addition
-	// to the operator-built defaults (DNS + 443).
+	// AllowedEgressCIDRs is the set of CIDRs the agent may connect to in
+	// addition to operator-built DNS egress.
 	// +listType=set
 	// +optional
 	AllowedEgressCIDRs []string `json:"allowedEgressCIDRs,omitempty"`
@@ -565,7 +585,7 @@ type MetricsSpec struct {
 
 	// Secure: when true, /metrics requires bearer-token auth and uses HTTPS.
 	// The ServiceMonitor scheme/scrape settings must agree (lesson #435/#440).
-	// +kubebuilder:default=false
+	// +kubebuilder:default=true
 	// +optional
 	Secure *bool `json:"secure,omitempty"`
 }
@@ -804,10 +824,18 @@ type BackupSpec struct {
 
 // BackupS3Spec configures the S3-compatible remote target.
 type BackupS3Spec struct {
-	Bucket   string `json:"bucket"`
+	// +kubebuilder:validation:MinLength=3
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9.-]*[a-z0-9]$`
+	Bucket string `json:"bucket"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[^[:space:][:cntrl:]]+$`
 	Endpoint string `json:"endpoint"`
 	// +optional
 	Region string `json:"region,omitempty"`
+	// +kubebuilder:validation:MaxLength=1024
+	// +kubebuilder:validation:Pattern=`^$|^[^[:cntrl:]]+$`
 	// +optional
 	PathPrefix           string               `json:"pathPrefix,omitempty"`
 	CredentialsSecretRef LocalObjectReference `json:"credentialsSecretRef"`
@@ -881,6 +909,7 @@ type MigrationFromOpenClawSpec struct {
 }
 
 // MigrationFromOpenClawSource is exactly-one-of (validated by webhook).
+// +kubebuilder:validation:XValidation:rule="has(self.openclawInstanceRef) != has(self.backupRef)",message="set exactly one of openclawInstanceRef or backupRef"
 type MigrationFromOpenClawSource struct {
 	// +optional
 	OpenClawInstanceRef *NamespacedObjectReference `json:"openclawInstanceRef,omitempty"`
@@ -902,10 +931,19 @@ type MigrationBackupRef struct {
 
 // MigrationBackupS3 mirrors BackupS3Spec but adds an explicit Key.
 type MigrationBackupS3 struct {
-	Bucket   string `json:"bucket"`
+	// +kubebuilder:validation:MinLength=3
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9.-]*[a-z0-9]$`
+	Bucket string `json:"bucket"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[^[:space:][:cntrl:]]+$`
 	Endpoint string `json:"endpoint"`
 	// +optional
-	Region               string               `json:"region,omitempty"`
+	Region string `json:"region,omitempty"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=1024
+	// +kubebuilder:validation:Pattern=`^[^[:cntrl:]]+$`
 	Key                  string               `json:"key"`
 	CredentialsSecretRef LocalObjectReference `json:"credentialsSecretRef"`
 }
@@ -1080,10 +1118,10 @@ type RuntimeSpec struct {
 	// +optional
 	Ripgrep RipgrepSpec `json:"ripgrep,omitempty"`
 
-	// ExtraAptPackages adds additional Debian packages installed by a
-	// root-privileged init container BEFORE the main agent container starts.
-	// Use sparingly: the init container runs as root and breaks the otherwise
-	// hardened security posture for one container only.
+	// ExtraAptPackages is retained for API compatibility only. Non-empty values
+	// are rejected because init-container package installs do not affect the
+	// main container filesystem. Build a custom agent image with OS packages
+	// already installed instead.
 	// +listType=atomic
 	// +optional
 	ExtraAptPackages []string `json:"extraAptPackages,omitempty"`
