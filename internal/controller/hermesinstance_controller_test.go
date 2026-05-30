@@ -30,17 +30,36 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	hermesv1 "github.com/paperclipinc/hermes-operator/api/v1"
+	"github.com/paperclipinc/hermes-operator/internal/resources"
 )
 
 // Ptr returns a pointer to v. Local test helper: mirrors resources.Ptr but
 // avoids importing the internal package from the test file.
 func Ptr[T any](v T) *T { return &v }
+
+func hasEmptyPeerTCPPort(rules []networkingv1.NetworkPolicyEgressRule, port int) bool {
+	for _, rule := range rules {
+		if len(rule.To) != 0 {
+			continue
+		}
+		for _, p := range rule.Ports {
+			if p.Protocol != nil && *p.Protocol != corev1.ProtocolTCP {
+				continue
+			}
+			if p.Port != nil && p.Port.IntValue() == port {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 var _ = Describe("HermesInstance controller", func() {
 	const (
@@ -72,10 +91,9 @@ var _ = Describe("HermesInstance controller", func() {
 			return fmt.Errorf("HermesInstance %s still exists", name)
 		}).Within(timeout).WithPolling(interval).Should(Succeed())
 
-		_ = k8sClient.Delete(ctx, &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}})
-		_ = k8sClient.Delete(ctx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}})
-		_ = k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name + "-config", Namespace: namespace}})
-		_ = k8sClient.Delete(ctx, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: name + "-data", Namespace: namespace}})
+		cleanupHermesInstanceOwnedResources(ctx, name, namespace)
+		_ = k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name + "-workspace", Namespace: namespace}})
+		_ = k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "workspace-base", Namespace: namespace}})
 
 		// Wait for the StatefulSet to be gone before the next test starts.
 		Eventually(func() error {
@@ -89,6 +107,7 @@ var _ = Describe("HermesInstance controller", func() {
 			}
 			return fmt.Errorf("StatefulSet %s still exists", name)
 		}).Within(timeout).WithPolling(interval).Should(Succeed())
+
 	})
 
 	It("creates PVC, ConfigMap, Service, and StatefulSet for a new HermesInstance", func() {
@@ -115,6 +134,170 @@ var _ = Describe("HermesInstance controller", func() {
 			sts := &appsv1.StatefulSet{}
 			g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, sts)).To(Succeed())
 			g.Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal("ghcr.io/paperclipinc/hermes-agent:test"))
+		}).Within(timeout).WithPolling(interval).Should(Succeed())
+	})
+
+	It("skips the data PVC and mounts emptyDir when persistence is disabled", func() {
+		ctx := context.Background()
+		instName := name + "-emptydir"
+		DeferCleanup(func() {
+			cleanupCtx := context.Background()
+			_ = k8sClient.Delete(cleanupCtx, &hermesv1.HermesInstance{ObjectMeta: metav1.ObjectMeta{Name: instName, Namespace: namespace}})
+			_ = k8sClient.Delete(cleanupCtx, &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: instName, Namespace: namespace}})
+			_ = k8sClient.Delete(cleanupCtx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: instName, Namespace: namespace}})
+			_ = k8sClient.Delete(cleanupCtx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: instName + "-config", Namespace: namespace}})
+			_ = k8sClient.Delete(cleanupCtx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: instName + "-workspace", Namespace: namespace}})
+			_ = k8sClient.Delete(cleanupCtx, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: instName + "-data", Namespace: namespace}})
+		})
+
+		inst := &hermesv1.HermesInstance{
+			ObjectMeta: metav1.ObjectMeta{Name: instName, Namespace: namespace},
+			Spec: hermesv1.HermesInstanceSpec{
+				Image: hermesv1.ImageSpec{
+					Repository: "ghcr.io/paperclipinc/hermes-agent",
+					Tag:        "test",
+				},
+				Storage: hermesv1.StorageSpec{
+					Persistence: hermesv1.PersistenceSpec{Enabled: Ptr(false)},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, inst)).To(Succeed())
+
+		Eventually(func(g Gomega) {
+			sts := &appsv1.StatefulSet{}
+			g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: instName, Namespace: namespace}, sts)).To(Succeed())
+			var dataVolume *corev1.Volume
+			for i := range sts.Spec.Template.Spec.Volumes {
+				if sts.Spec.Template.Spec.Volumes[i].Name == "data" {
+					dataVolume = &sts.Spec.Template.Spec.Volumes[i]
+					break
+				}
+			}
+			g.Expect(dataVolume).NotTo(BeNil())
+			g.Expect(dataVolume.EmptyDir).NotTo(BeNil())
+			g.Expect(dataVolume.PersistentVolumeClaim).To(BeNil())
+		}).Within(timeout).WithPolling(interval).Should(Succeed())
+
+		Consistently(func() bool {
+			pvc := &corev1.PersistentVolumeClaim{}
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: instName + "-data", Namespace: namespace}, pvc)
+			return apierrors.IsNotFound(err)
+		}).Within(time.Second).WithPolling(100 * time.Millisecond).Should(BeTrue())
+	})
+
+	It("merges workspace configMapRef entries and lets spec.workspace.initialFiles win", func() {
+		ctx := context.Background()
+		base := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "workspace-base", Namespace: namespace},
+			Data: map[string]string{
+				resources.EncodeWorkspacePath("notes/shared.md"): "from-base",
+				resources.EncodeWorkspacePath("notes/base.md"):   "base-only",
+				"raw-key": "raw-value",
+			},
+		}
+		Expect(k8sClient.Create(ctx, base)).To(Succeed())
+
+		inst := &hermesv1.HermesInstance{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+			Spec: hermesv1.HermesInstanceSpec{
+				Image: hermesv1.ImageSpec{
+					Repository: "ghcr.io/paperclipinc/hermes-agent",
+					Tag:        "test",
+				},
+				Workspace: hermesv1.WorkspaceSpec{
+					ConfigMapRef: &corev1.LocalObjectReference{Name: "workspace-base"},
+					InitialFiles: []hermesv1.WorkspaceFile{
+						{Path: "notes/shared.md", Content: "from-spec"},
+					},
+					InitialDirs: []string{"notes"},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, inst)).To(Succeed())
+
+		Eventually(func(g Gomega) {
+			cm := &corev1.ConfigMap{}
+			g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-workspace", Namespace: namespace}, cm)).To(Succeed())
+			g.Expect(cm.Data).To(HaveKeyWithValue(resources.EncodeWorkspacePath("notes/shared.md"), "from-spec"))
+			g.Expect(cm.Data).To(HaveKeyWithValue(resources.EncodeWorkspacePath("notes/base.md"), "base-only"))
+			g.Expect(cm.Data).To(HaveKeyWithValue("raw-key", "raw-value"))
+			g.Expect(cm.Data).To(HaveKeyWithValue(resources.InitialDirsKey, "notes\n"))
+		}).Within(timeout).WithPolling(interval).Should(Succeed())
+	})
+
+	It("marks ConfigReady false and skips the StatefulSet when workspace configMapRef is missing", func() {
+		ctx := context.Background()
+
+		inst := &hermesv1.HermesInstance{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+			Spec: hermesv1.HermesInstanceSpec{
+				Image: hermesv1.ImageSpec{
+					Repository: "ghcr.io/paperclipinc/hermes-agent",
+					Tag:        "test",
+				},
+				Workspace: hermesv1.WorkspaceSpec{
+					ConfigMapRef: &corev1.LocalObjectReference{Name: "missing-workspace-base"},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, inst)).To(Succeed())
+
+		Eventually(func(g Gomega) {
+			got := &hermesv1.HermesInstance{}
+			g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, got)).To(Succeed())
+			configReady := meta.FindStatusCondition(got.Status.Conditions, hermesv1.ConditionTypeConfigReady)
+			g.Expect(configReady).NotTo(BeNil())
+			g.Expect(configReady.Status).To(Equal(metav1.ConditionFalse))
+			g.Expect(configReady.Reason).To(Equal("Error"))
+			ready := meta.FindStatusCondition(got.Status.Conditions, hermesv1.ConditionTypeReady)
+			g.Expect(ready).NotTo(BeNil())
+			g.Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			g.Expect(ready.Reason).To(Equal("SubsystemError"))
+		}).Within(timeout).WithPolling(interval).Should(Succeed())
+
+		Consistently(func() bool {
+			sts := &appsv1.StatefulSet{}
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, sts)
+			return apierrors.IsNotFound(err)
+		}).Within(time.Second).WithPolling(100 * time.Millisecond).Should(BeTrue())
+	})
+
+	It("marks backup and Ready false when backup CronJob reconciliation fails", func() {
+		ctx := context.Background()
+
+		inst := &hermesv1.HermesInstance{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+			Spec: hermesv1.HermesInstanceSpec{
+				Image: hermesv1.ImageSpec{
+					Repository: "ghcr.io/paperclipinc/hermes-agent",
+					Tag:        "test",
+				},
+				Backup: hermesv1.BackupSpec{
+					Schedule: "not a cron",
+					S3: &hermesv1.BackupS3Spec{
+						Bucket:   "test-bucket",
+						Endpoint: "https://s3.example.com",
+						CredentialsSecretRef: hermesv1.LocalObjectReference{
+							Name: "backup-creds",
+						},
+					},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, inst)).To(Succeed())
+
+		Eventually(func(g Gomega) {
+			got := &hermesv1.HermesInstance{}
+			g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, got)).To(Succeed())
+			backupReady := meta.FindStatusCondition(got.Status.Conditions, hermesv1.ConditionBackupReady)
+			g.Expect(backupReady).NotTo(BeNil())
+			g.Expect(backupReady.Status).To(Equal(metav1.ConditionFalse))
+			g.Expect(backupReady.Reason).To(Equal("Error"))
+			ready := meta.FindStatusCondition(got.Status.Conditions, hermesv1.ConditionTypeReady)
+			g.Expect(ready).NotTo(BeNil())
+			g.Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			g.Expect(ready.Reason).To(Equal("SubsystemError"))
 		}).Within(timeout).WithPolling(interval).Should(Succeed())
 	})
 
@@ -162,8 +345,10 @@ var _ = Describe("HermesInstance: full subsystems", func() {
 	)
 
 	AfterEach(func() {
+		ctx := context.Background()
 		inst := &hermesv1.HermesInstance{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}}
-		_ = k8sClient.Delete(context.Background(), inst)
+		_ = k8sClient.Delete(ctx, inst)
+		cleanupHermesInstanceOwnedResources(ctx, name, namespace)
 	})
 
 	It("creates per-subsystem resources for a maximal HermesInstance", func() {
@@ -277,10 +462,11 @@ var _ = Describe("HermesInstance reconciler: gateways", func() {
 	AfterEach(func() {
 		ctx := context.Background()
 		_ = k8sClient.Delete(ctx, &hermesv1.HermesInstance{ObjectMeta: metav1.ObjectMeta{Name: instName, Namespace: ns}})
+		cleanupHermesInstanceOwnedResources(ctx, instName, ns)
 		_ = k8sClient.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tg-secret", Namespace: ns}})
 	})
 
-	It("propagates gateway env vars into the StatefulSet and an egress rule into the NetworkPolicy", func() {
+	It("propagates gateway env vars without opening broad gateway egress", func() {
 		ctx := context.Background()
 		inst := &hermesv1.HermesInstance{
 			ObjectMeta: metav1.ObjectMeta{Name: instName, Namespace: ns},
@@ -317,15 +503,7 @@ var _ = Describe("HermesInstance reconciler: gateways", func() {
 		Eventually(func(g Gomega) {
 			var np networkingv1.NetworkPolicy
 			g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: instName, Namespace: ns}, &np)).To(Succeed())
-			has443 := false
-			for _, r := range np.Spec.Egress {
-				for _, p := range r.Ports {
-					if p.Port != nil && p.Port.IntVal == 443 {
-						has443 = true
-					}
-				}
-			}
-			g.Expect(has443).To(BeTrue(), "egress rule for gateway endpoints (443/TCP)")
+			g.Expect(hasEmptyPeerTCPPort(np.Spec.Egress, 443)).To(BeFalse(), "gateway enablement must not allow TCP/443 to all destinations")
 		}, "30s", "250ms").Should(Succeed())
 	})
 
@@ -388,6 +566,7 @@ var _ = Describe("HermesInstance reconciler: Honcho profile store", func() {
 	AfterEach(func() {
 		ctx := context.Background()
 		_ = k8sClient.Delete(ctx, &hermesv1.HermesInstance{ObjectMeta: metav1.ObjectMeta{Name: instName, Namespace: ns}})
+		cleanupHermesInstanceOwnedResources(ctx, instName, ns)
 		_ = k8sClient.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "honcho-secret", Namespace: ns}})
 	})
 
@@ -487,6 +666,7 @@ var _ = Describe("HermesInstance reconciler: idempotency canary (Plan 3 surface)
 	AfterEach(func() {
 		ctx := context.Background()
 		_ = k8sClient.Delete(ctx, &hermesv1.HermesInstance{ObjectMeta: metav1.ObjectMeta{Name: instName, Namespace: ns}})
+		cleanupHermesInstanceOwnedResources(ctx, instName, ns)
 		_ = k8sClient.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tg", Namespace: ns}})
 		_ = k8sClient.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "honcho", Namespace: ns}})
 	})

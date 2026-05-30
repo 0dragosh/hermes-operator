@@ -81,6 +81,7 @@ var _ = Describe("Migration sub-controller", func() {
 		Eventually(func() error {
 			return k8sClient.Get(ctx, types.NamespacedName{Name: mName, Namespace: namespace}, inst)
 		}, timeout, interval).Should(Satisfy(apierrors.IsNotFound))
+		cleanupHermesInstanceOwnedResources(ctx, mName, namespace)
 	})
 
 	Context("init-migrate-from-openclaw injection", func() {
@@ -103,6 +104,20 @@ var _ = Describe("Migration sub-controller", func() {
 				}
 				return false
 			}, timeout, interval).Should(BeTrue(), "STS should have init-migrate-from-openclaw init container")
+		})
+
+		It("marks ConditionMigrationCompleted=False while waiting for the StatefulSet pod", func() {
+			inst := newMigrationInstanceOpenClaw()
+			Expect(k8sClient.Create(ctx, inst)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				fresh := &hermesv1.HermesInstance{}
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: mName, Namespace: namespace}, fresh)).To(Succeed())
+				cond := meta.FindStatusCondition(fresh.Status.Conditions, hermesv1.ConditionMigrationCompleted)
+				g.Expect(cond).NotTo(BeNil())
+				g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+				g.Expect(cond.Reason).To(Equal("WaitingForPod"))
+			}, timeout, interval).Should(Succeed())
 		})
 
 		It("removes init-migrate-from-openclaw once status.migration.completed=true", func() {

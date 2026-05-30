@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -36,7 +37,8 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, inst *hermesv1.Hermes
 		return ctrl.Result{}, true, nil
 	}
 	if inst.Status.RestoredFrom == inst.Spec.RestoreFrom {
-		if !meta.IsStatusConditionTrue(inst.Status.Conditions, hermesv1.ConditionRestoreApplied) {
+		condition := meta.FindStatusCondition(inst.Status.Conditions, hermesv1.ConditionRestoreApplied)
+		if condition == nil || condition.Status != metav1.ConditionTrue || condition.ObservedGeneration != inst.Generation {
 			meta.SetStatusCondition(&inst.Status.Conditions, metav1.Condition{
 				Type:               hermesv1.ConditionRestoreApplied,
 				Status:             metav1.ConditionTrue,
@@ -52,7 +54,14 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, inst *hermesv1.Hermes
 	pod := &corev1.Pod{}
 	if err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: inst.Namespace}, pod); err != nil {
 		if apierrors.IsNotFound(err) {
-			return ctrl.Result{}, false, nil
+			meta.SetStatusCondition(&inst.Status.Conditions, metav1.Condition{
+				Type:               hermesv1.ConditionRestoreApplied,
+				Status:             metav1.ConditionFalse,
+				Reason:             "WaitingForPod",
+				Message:            fmt.Sprintf("waiting for pod %s before restore can complete", podName),
+				ObservedGeneration: inst.Generation,
+			})
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, false, nil
 		}
 		return ctrl.Result{}, false, err
 	}
@@ -102,5 +111,5 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, inst *hermesv1.Hermes
 		Message:            fmt.Sprintf("init-restore in progress for %s", inst.Spec.RestoreFrom),
 		ObservedGeneration: inst.Generation,
 	})
-	return ctrl.Result{}, false, nil
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, false, nil
 }

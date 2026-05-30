@@ -37,8 +37,8 @@ type BackupReconciler struct {
 // CRITICAL: lesson #437: finalizer mutation uses r.Patch(ctx, inst, client.MergeFrom(original)),
 // NEVER r.Update: Update bumps metadata.generation and triggers a pod-replace.
 func (b *BackupReconciler) EnsureFinalizer(ctx context.Context, inst *hermesv1.HermesInstance) error {
-	if !inst.Spec.Backup.OnDelete {
-		return nil
+	if !inst.Spec.Backup.OnDelete || inst.Spec.Backup.S3 == nil || !resources.PersistenceEnabled(inst) {
+		return b.RemoveFinalizer(ctx, inst)
 	}
 	if controllerutil.ContainsFinalizer(inst, hermesv1.FinalizerBackupOnDelete) {
 		return nil
@@ -65,9 +65,71 @@ func (b *BackupReconciler) RemoveFinalizer(ctx context.Context, inst *hermesv1.H
 }
 
 // ReconcileCronJob creates/updates/deletes the periodic backup CronJob based on spec.backup.schedule.
-func (b *BackupReconciler) ReconcileCronJob(ctx context.Context, inst *hermesv1.HermesInstance) error {
-	if inst.Spec.Backup.Schedule == "" || inst.Spec.Backup.S3 == nil {
-		return b.deleteCronJob(ctx, inst, resources.BackupCronJobName(inst))
+func (b *BackupReconciler) ReconcileCronJob(ctx context.Context, inst *hermesv1.HermesInstance) (ctrl.Result, error) {
+	if inst.Spec.Backup.Schedule == "" {
+		if err := b.deleteCronJobs(ctx, inst); err != nil {
+			return ctrl.Result{}, err
+		}
+		if !inst.Spec.Backup.OnDelete {
+			meta.RemoveStatusCondition(&inst.Status.Conditions, hermesv1.ConditionBackupReady)
+			return ctrl.Result{}, nil
+		}
+		if inst.Spec.Backup.S3 == nil {
+			meta.SetStatusCondition(&inst.Status.Conditions, metav1.Condition{
+				Type:               hermesv1.ConditionBackupReady,
+				Status:             metav1.ConditionFalse,
+				Reason:             "S3NotConfigured",
+				Message:            "backup.onDelete requires spec.backup.s3",
+				ObservedGeneration: inst.Generation,
+			})
+			return ctrl.Result{}, nil
+		}
+		if !resources.PersistenceEnabled(inst) {
+			meta.SetStatusCondition(&inst.Status.Conditions, metav1.Condition{
+				Type:               hermesv1.ConditionBackupReady,
+				Status:             metav1.ConditionFalse,
+				Reason:             "PersistenceDisabled",
+				Message:            "backup.onDelete requires spec.storage.persistence.enabled=true",
+				ObservedGeneration: inst.Generation,
+			})
+			return ctrl.Result{}, nil
+		}
+		meta.SetStatusCondition(&inst.Status.Conditions, metav1.Condition{
+			Type:               hermesv1.ConditionBackupReady,
+			Status:             metav1.ConditionTrue,
+			Reason:             "OnDeleteConfigured",
+			Message:            "Final backup on delete is configured",
+			ObservedGeneration: inst.Generation,
+		})
+		return ctrl.Result{}, nil
+	}
+
+	if inst.Spec.Backup.S3 == nil {
+		if err := b.deleteCronJobs(ctx, inst); err != nil {
+			return ctrl.Result{}, err
+		}
+		meta.SetStatusCondition(&inst.Status.Conditions, metav1.Condition{
+			Type:               hermesv1.ConditionBackupReady,
+			Status:             metav1.ConditionFalse,
+			Reason:             "S3NotConfigured",
+			Message:            "scheduled backups require spec.backup.s3",
+			ObservedGeneration: inst.Generation,
+		})
+		return ctrl.Result{}, nil
+	}
+
+	if !resources.PersistenceEnabled(inst) {
+		if err := b.deleteCronJobs(ctx, inst); err != nil {
+			return ctrl.Result{}, err
+		}
+		meta.SetStatusCondition(&inst.Status.Conditions, metav1.Condition{
+			Type:               hermesv1.ConditionBackupReady,
+			Status:             metav1.ConditionFalse,
+			Reason:             "PersistenceDisabled",
+			Message:            "scheduled backups require spec.storage.persistence.enabled=true",
+			ObservedGeneration: inst.Generation,
+		})
+		return ctrl.Result{}, nil
 	}
 
 	obj := &batchv1.CronJob{ObjectMeta: metav1.ObjectMeta{
@@ -81,7 +143,7 @@ func (b *BackupReconciler) ReconcileCronJob(ctx context.Context, inst *hermesv1.
 		return controllerutil.SetControllerReference(inst, obj, b.Scheme)
 	})
 	if err != nil {
-		return fmt.Errorf("reconcile backup CronJob: %w", err)
+		return ctrl.Result{}, fmt.Errorf("reconcile backup CronJob: %w", err)
 	}
 
 	prune := &batchv1.CronJob{ObjectMeta: metav1.ObjectMeta{
@@ -95,7 +157,7 @@ func (b *BackupReconciler) ReconcileCronJob(ctx context.Context, inst *hermesv1.
 		return controllerutil.SetControllerReference(inst, prune, b.Scheme)
 	})
 	if err != nil {
-		return fmt.Errorf("reconcile prune CronJob: %w", err)
+		return ctrl.Result{}, fmt.Errorf("reconcile prune CronJob: %w", err)
 	}
 
 	meta.SetStatusCondition(&inst.Status.Conditions, metav1.Condition{
@@ -105,7 +167,14 @@ func (b *BackupReconciler) ReconcileCronJob(ctx context.Context, inst *hermesv1.
 		Message:            fmt.Sprintf("Backup CronJob %q scheduled %q", obj.Name, inst.Spec.Backup.Schedule),
 		ObservedGeneration: inst.Generation,
 	})
-	return nil
+	return ctrl.Result{}, nil
+}
+
+func (b *BackupReconciler) deleteCronJobs(ctx context.Context, inst *hermesv1.HermesInstance) error {
+	if err := b.deleteCronJob(ctx, inst, resources.BackupCronJobName(inst)); err != nil {
+		return err
+	}
+	return b.deleteCronJob(ctx, inst, resources.BackupPruneCronJobName(inst))
 }
 
 func (b *BackupReconciler) deleteCronJob(ctx context.Context, inst *hermesv1.HermesInstance, name string) error {
@@ -134,6 +203,13 @@ func (b *BackupReconciler) HandleDeletion(ctx context.Context, inst *hermesv1.He
 		return ctrl.Result{}, false, nil
 	}
 
+	if !inst.Spec.Backup.OnDelete {
+		if err := b.RemoveFinalizer(ctx, inst); err != nil {
+			return ctrl.Result{}, true, err
+		}
+		return ctrl.Result{}, false, nil
+	}
+
 	if inst.Annotations[hermesv1.AnnotationSkipFinalBackup] == "true" {
 		b.Recorder.Eventf(inst, corev1.EventTypeWarning, "FinalBackupSkipped",
 			"Skipping final backup because annotation %q is true", hermesv1.AnnotationSkipFinalBackup)
@@ -146,6 +222,15 @@ func (b *BackupReconciler) HandleDeletion(ctx context.Context, inst *hermesv1.He
 	if inst.Spec.Backup.S3 == nil {
 		b.Recorder.Eventf(inst, corev1.EventTypeWarning, "FinalBackupSkipped",
 			"spec.backup.s3 is unset; cannot run final backup")
+		if err := b.RemoveFinalizer(ctx, inst); err != nil {
+			return ctrl.Result{}, true, err
+		}
+		return ctrl.Result{}, false, nil
+	}
+
+	if !resources.PersistenceEnabled(inst) {
+		b.Recorder.Eventf(inst, corev1.EventTypeWarning, "FinalBackupSkipped",
+			"spec.storage.persistence.enabled=false; cannot run final backup")
 		if err := b.RemoveFinalizer(ctx, inst); err != nil {
 			return ctrl.Result{}, true, err
 		}

@@ -62,7 +62,7 @@ var _ = Describe("HermesSelfConfig: GitOps coexistence (SSA)", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: "ssa-sc-1", Namespace: ssaNS},
 			Spec: hermesv1.HermesSelfConfigSpec{
 				InstanceRef: ssaName,
-				AddEnvVars:  []hermesv1.SelfConfigEnvVar{{Name: "TZ", Value: "UTC"}},
+				AddEnvVars:  []hermesv1.SelfConfigEnvVar{{Name: "TZ", Value: Ptr("UTC")}},
 			},
 		}
 		Expect(k8sClient.Create(ctx, sc)).To(Succeed())

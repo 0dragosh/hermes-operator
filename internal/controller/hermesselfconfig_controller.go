@@ -55,6 +55,7 @@ type HermesSelfConfigReconciler struct {
 // +kubebuilder:rbac:groups=hermes.agent,resources=hermesselfconfigs/finalizers,verbs=update
 // +kubebuilder:rbac:groups=hermes.agent,resources=hermesinstances,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
@@ -127,6 +128,15 @@ func (r *HermesSelfConfigReconciler) Reconcile(ctx context.Context, req ctrl.Req
 func (r *HermesSelfConfigReconciler) applyAll(ctx context.Context, parent *hermesv1.HermesInstance, sc *hermesv1.HermesSelfConfig) ([]string, error) {
 	var applied []string
 
+	var workspaceFilesPatch *corev1.ConfigMap
+	if len(sc.Spec.AddWorkspaceFiles) > 0 {
+		var err error
+		workspaceFilesPatch, err = r.buildWorkspaceFilesPatch(ctx, parent, sc)
+		if err != nil {
+			return applied, err
+		}
+	}
+
 	if len(sc.Spec.AddSkills) > 0 {
 		patch := buildSkillsPatch(parent, sc)
 		if err := r.applySSA(ctx, patch, sc); err != nil {
@@ -151,8 +161,8 @@ func (r *HermesSelfConfigReconciler) applyAll(ctx context.Context, parent *herme
 	if sc.Spec.PatchConfig != nil && len(sc.Spec.PatchConfig.Raw) > 0 {
 		cmPatch = buildPatchConfigPayload(parent, sc)
 	}
-	if len(sc.Spec.AddWorkspaceFiles) > 0 {
-		cmPatch = mergeConfigMapPatches(cmPatch, buildWorkspaceFilesPatch(parent, sc))
+	if workspaceFilesPatch != nil {
+		cmPatch = mergeConfigMapPatches(cmPatch, workspaceFilesPatch)
 	}
 	if cmPatch != nil {
 		if err := r.applySSA(ctx, cmPatch, sc); err != nil {

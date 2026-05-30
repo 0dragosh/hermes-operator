@@ -6,11 +6,13 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	hermesv1 "github.com/paperclipinc/hermes-operator/api/v1"
+	"github.com/paperclipinc/hermes-operator/internal/resources"
 )
 
 var _ = Describe("HermesSelfConfig controller", func() {
@@ -28,6 +30,10 @@ var _ = Describe("HermesSelfConfig controller", func() {
 		ctx := context.Background()
 		for _, name := range []string{"deny-target", "happy-target"} {
 			_ = k8sClient.Delete(ctx, &hermesv1.HermesInstance{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		}
+		for _, name := range []string{"happy-target-workspace", "selfconfig-secret"} {
+			_ = k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+			_ = k8sClient.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
 		}
 		scs := &hermesv1.HermesSelfConfigList{}
 		_ = k8sClient.List(ctx, scs, &client.ListOptions{Namespace: ns})
@@ -91,7 +97,7 @@ var _ = Describe("HermesSelfConfig controller", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: "idem-test", Namespace: ns},
 			Spec: hermesv1.HermesSelfConfigSpec{
 				InstanceRef: "happy-target",
-				AddEnvVars:  []hermesv1.SelfConfigEnvVar{{Name: "TZ", Value: "UTC"}},
+				AddEnvVars:  []hermesv1.SelfConfigEnvVar{{Name: "TZ", Value: Ptr("UTC")}},
 			},
 		}
 		Expect(k8sClient.Create(ctx, sc)).To(Succeed())
@@ -126,5 +132,107 @@ var _ = Describe("HermesSelfConfig controller", func() {
 		Expect(second.Status.Phase).To(Equal(hermesv1.SelfConfigPhaseApplied))
 		Expect(second.Status.AppliedAt.Equal(firstApplied)).To(BeTrue(),
 			"AppliedAt must not advance on no-op reconciles: the controller short-circuits via ObservedGeneration")
+	})
+
+	It("applies workspace file content from a same-namespace Secret key", func() {
+		ctx := context.Background()
+		trueP := true
+
+		parent := &hermesv1.HermesInstance{
+			ObjectMeta: metav1.ObjectMeta{Name: "happy-target", Namespace: ns},
+			Spec: hermesv1.HermesInstanceSpec{
+				Image: hermesv1.ImageSpec{
+					Repository: "ghcr.io/paperclipinc/hermes-agent",
+					Tag:        "test",
+				},
+				SelfConfigure: hermesv1.SelfConfigureSpec{
+					Enabled:        &trueP,
+					AllowedActions: []hermesv1.SelfConfigAction{hermesv1.ActionWorkspaceFiles},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, parent)).To(Succeed())
+		Expect(k8sClient.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "selfconfig-secret", Namespace: ns},
+			Data:       map[string][]byte{"notes.md": []byte("# Secret notes")},
+		})).To(Succeed())
+
+		sc := &hermesv1.HermesSelfConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: "content-from", Namespace: ns},
+			Spec: hermesv1.HermesSelfConfigSpec{
+				InstanceRef: "happy-target",
+				AddWorkspaceFiles: []hermesv1.SelfConfigWorkspaceFile{{
+					Path: "notes/secret.md",
+					ContentFrom: &hermesv1.SelfConfigKeySelector{
+						Name: "selfconfig-secret",
+						Key:  "notes.md",
+					},
+				}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, sc)).To(Succeed())
+
+		Eventually(func(g Gomega) {
+			got := &corev1.ConfigMap{}
+			g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "happy-target-workspace", Namespace: ns}, got)).To(Succeed())
+			g.Expect(got.Data[resources.EncodeWorkspacePath("notes/secret.md")]).To(Equal("# Secret notes"))
+		}).Within(timeout).WithPolling(poll).Should(Succeed())
+	})
+
+	It("denies contentFrom when the Secret key is missing without applying sibling files", func() {
+		ctx := context.Background()
+		trueP := true
+
+		parent := &hermesv1.HermesInstance{
+			ObjectMeta: metav1.ObjectMeta{Name: "happy-target", Namespace: ns},
+			Spec: hermesv1.HermesInstanceSpec{
+				Image: hermesv1.ImageSpec{
+					Repository: "ghcr.io/paperclipinc/hermes-agent",
+					Tag:        "test",
+				},
+				SelfConfigure: hermesv1.SelfConfigureSpec{
+					Enabled:        &trueP,
+					AllowedActions: []hermesv1.SelfConfigAction{hermesv1.ActionWorkspaceFiles},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, parent)).To(Succeed())
+		Expect(k8sClient.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "selfconfig-secret", Namespace: ns},
+			Data:       map[string][]byte{"present.md": []byte("present")},
+		})).To(Succeed())
+
+		sc := &hermesv1.HermesSelfConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: "missing-content-key", Namespace: ns},
+			Spec: hermesv1.HermesSelfConfigSpec{
+				InstanceRef: "happy-target",
+				AddWorkspaceFiles: []hermesv1.SelfConfigWorkspaceFile{
+					{Path: "literal.md", Content: Ptr("must not apply")},
+					{
+						Path: "missing.md",
+						ContentFrom: &hermesv1.SelfConfigKeySelector{
+							Name: "selfconfig-secret",
+							Key:  "missing.md",
+						},
+					},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, sc)).To(Succeed())
+
+		Eventually(func(g Gomega) {
+			got := &hermesv1.HermesSelfConfig{}
+			g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "missing-content-key", Namespace: ns}, got)).To(Succeed())
+			g.Expect(got.Status.Phase).To(Equal(hermesv1.SelfConfigPhaseDenied))
+			g.Expect(got.Status.DenyReason).To(ContainSubstring("missing.md"))
+		}).Within(timeout).WithPolling(poll).Should(Succeed())
+
+		Consistently(func() string {
+			got := &corev1.ConfigMap{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: "happy-target-workspace", Namespace: ns}, got); err != nil {
+				return ""
+			}
+			return got.Data[resources.EncodeWorkspacePath("literal.md")]
+		}, 2*time.Second, poll).Should(BeEmpty())
 	})
 })
