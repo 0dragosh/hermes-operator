@@ -24,7 +24,7 @@ in place from day one: no v0.x grind.
 > Inspired by [openclaw-rocks/openclaw-operator](https://github.com/openclaw-rocks/openclaw-operator);
 > openclaw lessons #437, #446, #433, #471, #479, #458, #469 (and many more)
 > informed concrete guardrails baked into v1. See
-> [docs/superpowers/specs/2026-05-12-hermes-operator-design.md](docs/superpowers/specs/2026-05-12-hermes-operator-design.md) §1.G3.
+> [docs/superpowers/specs/2026-05-12-hermes-operator-design.md](docs/superpowers/specs/2026-05-12-hermes-operator-design.md) section 1.G3.
 
 ## Quickstart
 
@@ -130,27 +130,27 @@ fields only: explicit values on the instance always win.
 | **Declarative** | `HermesClusterDefaults` for cluster-wide defaults | Defaulting webhook fills `nil` fields only. |
 | **Adaptive** | `HermesSelfConfig` for audited agent-initiated mutations | SSA under field manager `hermes.agent/selfconfig`. Policy-gated by `spec.selfConfigure.protectedKeys`. |
 | **Adaptive** | OCI-registry-driven auto-update | Channel-pinned polling, pre-update backup, probe-failure rollback. |
-| **Secure** | Default-deny NetworkPolicy + per-gateway allow rules | Derived from `spec.gateways` and `spec.networking.egress`. |
+| **Secure** | Default-deny NetworkPolicy | DNS egress by default; add upstream egress with `spec.security.networkPolicy.allowedEgressCIDRs` or `additionalEgress`. |
 | **Secure** | Read-only root filesystem | Writable `emptyDir`s for `/tmp` and `~/.config` subPaths. |
 | **Secure** | Per-CRD validating + defaulting webhooks | Plus warnings on unknown config keys and unresolvable gateway tokens. |
 | **Secure** | RBAC aggregation labels | `kubectl auth can-i create hermesinstances --as=jane` works out of the box. |
 | **Secure** | Image signing + SBOM | Cosign keyless OIDC, SPDX SBOM on every release. |
 | **Observable** | Prometheus metrics + ServiceMonitor | Per-controller, per-instance, per-subsystem. `metrics.secure` consistent. |
 | **Observable** | [Grafana dashboard](docs/grafana/) | Ships as JSON. Variables: `namespace`, `instance`. |
-| **Observable** | Exhaustive [condition catalogue](docs/conditions.md) | Every condition × every reason code, documented and stable. |
+| **Observable** | Exhaustive [condition catalogue](docs/conditions.md) | Every condition x every reason code, documented and stable. |
 | **Multi-platform** | Telegram / Discord / Slack / WhatsApp / Signal gateways | First-class `spec.gateways.*` sections, secret-rotation-friendly. |
 | **Python runtime** | `uv`-installable agent runtime | Init container runs `uv sync` against a lockfile bundled in the agent image. |
 | **Python runtime** | FFmpeg + ripgrep available out of the box | Hard dependencies of hermes-agent. |
-| **Scalable** | Optional HPA via `spec.availability.hpa` | StatefulSet retained for identity through restarts. |
+| **Scalable** | Optional HPA via `spec.availability.horizontalPodAutoscaler` | StatefulSet retained for identity through restarts. |
 | **Scalable** | Optional `topologySpreadConstraints` | Sane defaults plus `spec.availability.topologySpreadConstraints` override. |
 | **Resilient** | PodDisruptionBudget auto-managed when `replicas > 1` | |
 | **Resilient** | Finalizer-driven backup-on-delete | `r.Patch` (JSON patch) for finalizer mutations, never `r.Update`. |
 | **Resilient** | Zombie-process reaper | `tini` as PID 1; `shareProcessNamespace: false` by default. |
-| **Backup / Restore** | S3-compatible backups | Scheduled, on-delete, pre-update. `tar.zst` snapshots + `meta.json`. |
+| **Backup / Restore** | S3-compatible backups | Scheduled, on-delete, pre-update. Raw `.tar.zst` snapshots containing `meta.json`. |
 | **Backup / Restore** | Declarative one-shot restore | `spec.restoreFrom` is immutable once applied. |
-| **Migration** | One-shot OpenClaw → Hermes migration | From sibling `OpenClawInstance` or S3 backup. Uses hermes-agent's importer. |
+| **Migration** | One-shot OpenClaw to Hermes migration | From sibling `OpenClawInstance` or S3 backup. Uses hermes-agent's importer. |
 | **Profile store** | Optional Honcho companion | Deployment + Service + PVC + secret, fully managed. |
-| **Gateway auth** | Per-platform `secretRef` for tokens | Rotate independently, audited via webhook warnings. |
+| **Gateway auth** | Per-platform Secret selectors | Uses `botTokenSecretRef`, `appTokenSecretRef`, `signingSecretRef`, `providerSecretRef`, `phoneNumberSecretRef`, and `authTokenSecretRef`. |
 | **Cloud-native** | Helm chart, OLM bundle, plain kustomize manifests | All three are first-class. CRDs templated under the Helm chart. |
 | **Cloud-native** | Multi-arch (`amd64`+`arm64`), Cosign-signed, SBOM-attested | |
 | **GitOps** | SSA-based SelfConfig coexists with Argo/Flux | No flap on shared instances. |

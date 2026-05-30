@@ -99,7 +99,7 @@ spec:
         name: hermes-maximal-extra-env
   sidecars:
     - name: log-shipper
-      image: fluent/fluent-bit:latest
+      image: fluent/fluent-bit:3.2.4
       resources:
         requests:
           cpu: 50m

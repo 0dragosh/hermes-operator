@@ -27,35 +27,41 @@ func TestBuildNetworkPolicy_SameNamespaceIngress(t *testing.T) {
 	t.Parallel()
 	inst := &hermesv1.HermesInstance{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "agents"}}
 	np := BuildNetworkPolicy(inst)
-	require := false
-	for _, rule := range np.Spec.Ingress {
-		for _, from := range rule.From {
-			if from.NamespaceSelector != nil &&
-				from.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] == "agents" {
-				require = true
-			}
-		}
+	assert.False(t, hasIngressFromNamespace(np, "agents"), "same-namespace ingress should be opt-in")
+}
+
+func TestBuildNetworkPolicy_AllowSameNamespaceIngress(t *testing.T) {
+	t.Parallel()
+	inst := &hermesv1.HermesInstance{
+		ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "agents"},
+		Spec: hermesv1.HermesInstanceSpec{
+			Security: hermesv1.SecuritySpec{
+				NetworkPolicy: hermesv1.NetworkPolicySpec{AllowSameNamespaceIngress: Ptr(true)},
+			},
+		},
 	}
-	assert.True(t, require, "expected ingress rule from same namespace")
+	np := BuildNetworkPolicy(inst)
+	assert.True(t, hasIngressFromNamespace(np, "agents"), "expected opt-in ingress rule from same namespace")
 }
 
 func TestBuildNetworkPolicy_DefaultDNSEgress(t *testing.T) {
 	t.Parallel()
 	inst := &hermesv1.HermesInstance{ObjectMeta: metav1.ObjectMeta{Name: "demo"}}
 	np := BuildNetworkPolicy(inst)
-	foundUDP53, foundTCP443 := false, false
+	foundUDP53, foundTCP53 := false, false
 	for _, rule := range np.Spec.Egress {
 		for _, p := range rule.Ports {
 			if p.Protocol != nil && *p.Protocol == corev1.ProtocolUDP && p.Port != nil && p.Port.IntValue() == 53 {
 				foundUDP53 = true
 			}
-			if p.Protocol != nil && *p.Protocol == corev1.ProtocolTCP && p.Port != nil && p.Port.IntValue() == 443 {
-				foundTCP443 = true
+			if p.Protocol != nil && *p.Protocol == corev1.ProtocolTCP && p.Port != nil && p.Port.IntValue() == 53 {
+				foundTCP53 = true
 			}
 		}
 	}
 	assert.True(t, foundUDP53, "default-allow DNS UDP/53")
-	assert.True(t, foundTCP443, "default-allow HTTPS TCP/443")
+	assert.True(t, foundTCP53, "default-allow DNS TCP/53")
+	assert.False(t, hasEmptyPeerTCPPort(np.Spec.Egress, 443), "default egress should not allow TCP/443 to all destinations")
 }
 
 func TestBuildNetworkPolicy_AllowDNSDisabled(t *testing.T) {
@@ -92,19 +98,15 @@ func TestBuildNetworkPolicy_AllowedIngressNamespacesAndCIDRs(t *testing.T) {
 		},
 	}
 	np := BuildNetworkPolicy(inst)
-	var sawNS, sawCIDR bool
+	var sawCIDR bool
 	for _, rule := range np.Spec.Ingress {
 		for _, from := range rule.From {
-			if from.NamespaceSelector != nil &&
-				from.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] == "prometheus" {
-				sawNS = true
-			}
 			if from.IPBlock != nil && from.IPBlock.CIDR == "10.0.0.0/8" {
 				sawCIDR = true
 			}
 		}
 	}
-	assert.True(t, sawNS, "expected ingress rule for namespace prometheus")
+	assert.True(t, hasIngressFromNamespace(np, "prometheus"), "expected ingress rule for namespace prometheus")
 	assert.True(t, sawCIDR, "expected ingress rule for CIDR 10.0.0.0/8")
 }
 
@@ -152,15 +154,7 @@ func TestExtraEgressRules_TelegramAndDiscord(t *testing.T) {
 		},
 	}
 	rules := ExtraEgressRules(inst)
-	hasTCP443 := false
-	for _, r := range rules {
-		for _, p := range r.Ports {
-			if p.Protocol != nil && *p.Protocol == corev1.ProtocolTCP && p.Port != nil && p.Port.IntVal == 443 {
-				hasTCP443 = true
-			}
-		}
-	}
-	assert.True(t, hasTCP443, "at least one rule opens TCP/443 for gateway endpoints")
+	assert.False(t, hasEmptyPeerTCPPort(rules, 443), "gateway enablement should not open TCP/443 to all destinations")
 }
 
 func TestExtraEgressRules_HonchoSibling(t *testing.T) {
@@ -208,4 +202,33 @@ func TestBuildHonchoNetworkPolicy_IngressOnlyFromHermes(t *testing.T) {
 
 	assert.Empty(t, np.Spec.Egress)
 	assert.Contains(t, np.Spec.PolicyTypes, networkingv1.PolicyTypeEgress)
+}
+
+func hasIngressFromNamespace(np *networkingv1.NetworkPolicy, namespace string) bool {
+	for _, rule := range np.Spec.Ingress {
+		for _, from := range rule.From {
+			if from.NamespaceSelector != nil &&
+				from.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] == namespace {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasEmptyPeerTCPPort(rules []networkingv1.NetworkPolicyEgressRule, port int) bool {
+	for _, rule := range rules {
+		if len(rule.To) != 0 {
+			continue
+		}
+		for _, p := range rule.Ports {
+			if p.Protocol != nil && *p.Protocol != corev1.ProtocolTCP {
+				continue
+			}
+			if p.Port != nil && p.Port.IntValue() == port {
+				return true
+			}
+		}
+	}
+	return false
 }

@@ -5,14 +5,14 @@ metadata:
 spec:
   image:
     repository: ghcr.io/paperclipinc/hermes-agent
-    tag: latest
+    tag: v2026.5.29.2
   storage:
     persistence:
       enabled: true
       size: 5Gi
   sidecars:
     - name: ollama
-      image: ollama/ollama:latest
+      image: ollama/ollama:0.5.7
       ports:
         - containerPort: 11434
           name: ollama
@@ -21,7 +21,7 @@ spec:
           cpu: 500m
           memory: 2Gi
     - name: web-terminal
-      image: ghcr.io/paperclipinc/hermes-web-terminal:latest
+      image: ghcr.io/paperclipinc/hermes-web-terminal:v0.1.0
       ports:
         - containerPort: 7681
           name: web-terminal
@@ -30,7 +30,7 @@ spec:
           cpu: 50m
           memory: 64Mi
     - name: tailscale
-      image: tailscale/tailscale:latest
+      image: tailscale/tailscale:v1.78.1
       env:
         - name: TS_AUTHKEY
           valueFrom:

@@ -1,7 +1,7 @@
 package resources
 
 import (
-	"fmt"
+	"strconv"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -20,14 +20,66 @@ func BackupPruneCronJobName(inst *hermesv1.HermesInstance) string {
 	return inst.Name + "-backup-prune"
 }
 
+const pruneBackupScript = `set -eu
+: "${S3_BUCKET:?}"
+: "${S3_ENDPOINT_URL:?}"
+: "${SNAPSHOT_PREFIX:?}"
+: "${FAILED_SNAPSHOT_PREFIX:?}"
+: "${HISTORY_LIMIT:?}"
+: "${FAILED_HISTORY_LIMIT:?}"
+: "${AWS_ACCESS_KEY_ID:?}"
+: "${AWS_SECRET_ACCESS_KEY:?}"
+: "${AWS_DEFAULT_REGION:-}"
+
+WORKDIR="$(mktemp -d /tmp/hermes-prune.XXXXXX)"
+cleanup() {
+	rm -rf "$WORKDIR"
+}
+trap cleanup EXIT
+
+prune_prefix() {
+	prefix="$1"
+	keep="$2"
+	exclude="$3"
+	keys_file="$WORKDIR/keys"
+
+	aws --endpoint-url "$S3_ENDPOINT_URL" s3api list-objects-v2 \
+		--bucket "$S3_BUCKET" \
+		--prefix "$prefix" \
+		--query 'Contents[].Key' \
+		--output text \
+		| tr '\t' '\n' \
+		| sort -r > "$keys_file"
+
+	seen=0
+	while IFS= read -r key; do
+		[ -n "$key" ] || continue
+		case "$key" in
+			*.tar.zst) ;;
+			*) continue ;;
+		esac
+		if [ -n "$exclude" ]; then
+			case "$key" in
+				"$exclude"*) continue ;;
+			esac
+		fi
+		seen=$((seen + 1))
+		if [ "$seen" -le "$keep" ]; then
+			continue
+		fi
+		aws --endpoint-url "$S3_ENDPOINT_URL" s3 rm "s3://$S3_BUCKET/$key" --no-progress
+	done < "$keys_file"
+}
+
+prune_prefix "$SNAPSHOT_PREFIX" "$HISTORY_LIMIT" "$FAILED_SNAPSHOT_PREFIX"
+prune_prefix "$FAILED_SNAPSHOT_PREFIX" "$FAILED_HISTORY_LIMIT" ""
+`
+
 // BuildBackupCronJob returns the desired periodic backup CronJob. Caller is
 // responsible for setting OwnerReferences and applying via CreateOrUpdate.
 func BuildBackupCronJob(inst *hermesv1.HermesInstance) *batchv1.CronJob {
 	s3 := inst.Spec.Backup.S3
-	image := inst.Spec.Backup.Image
-	if image == "" {
-		image = ResticImage
-	}
+	image := backupImageRef(inst)
 
 	labels := LabelsForInstance(inst)
 	labels["hermes.agent/job-kind"] = "scheduled"
@@ -41,35 +93,13 @@ func BuildBackupCronJob(inst *hermesv1.HermesInstance) *batchv1.CronJob {
 		failedHistoryLimit = *inst.Spec.Backup.FailedHistoryLimit
 	}
 
-	region := ""
-	pathPrefix := ""
-	if s3 != nil {
-		region = s3.Region
-		pathPrefix = s3.PathPrefix
-	}
-
 	backoff := int32(3)
 	ttl := int32(86400)
 	gracePeriod := int64(30)
 
-	// Shell command: compute timestamp at runtime; build the snapshot key under
-	// `<pathPrefix><namespace>/<name>/<timestamp>.tar.zst`; archive and upload.
 	args := []string{
 		"-c",
-		fmt.Sprintf(
-			`set -euo pipefail
-TIMESTAMP=$(date -u +%%Y-%%m-%%dT%%H-%%M-%%SZ)
-KEY=%q
-KEY="${KEY}${TIMESTAMP}.tar.zst"
-META=$(mktemp)
-jq -n --arg uid %q --arg ts "$TIMESTAMP" --arg fmt "1" \
-    '{instance_uid:$uid, hermes_agent_version: env.HERMES_AGENT_VERSION // "", k8s_version: env.K8S_VERSION // "", timestamp:$ts, format_version:($fmt|tonumber)}' > "$META"
-tar --use-compress-program="zstd -T0 -19" -cf - -C /home/hermes/.hermes . "$META" \
-  | restic --repo "$RESTIC_REPOSITORY" --no-cache backup --stdin --stdin-filename "$KEY"
-`,
-			fmt.Sprintf("%s%s/%s/", pathPrefix, inst.Namespace, inst.Name),
-			string(inst.UID),
-		),
+		scheduledBackupScript,
 	}
 
 	podSpec := corev1.PodSpec{
@@ -77,6 +107,7 @@ tar --use-compress-program="zstd -T0 -19" -cf - -C /home/hermes/.hermes . "$META
 		DNSPolicy:                     corev1.DNSClusterFirst,
 		SchedulerName:                 "default-scheduler",
 		TerminationGracePeriodSeconds: &gracePeriod,
+		AutomountServiceAccountToken:  Ptr(false),
 		SecurityContext: &corev1.PodSecurityContext{
 			RunAsNonRoot: Ptr(true),
 			RunAsUser:    Ptr(int64(1000)),
@@ -86,40 +117,22 @@ tar --use-compress-program="zstd -T0 -19" -cf - -C /home/hermes/.hermes . "$META
 				Type: corev1.SeccompProfileTypeRuntimeDefault,
 			},
 		},
-		// Co-locate on the same node as the StatefulSet pod so we can mount
-		// the RWO PVC read-only.
-		Affinity: &corev1.Affinity{
-			PodAffinity: &corev1.PodAffinity{
-				RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
-					LabelSelector: &metav1.LabelSelector{
-						MatchLabels: map[string]string{
-							"app.kubernetes.io/name":     "hermes-agent",
-							"app.kubernetes.io/instance": inst.Name,
-						},
-					},
-					TopologyKey: "kubernetes.io/hostname",
-				}},
-			},
-		},
+		Affinity: backupPodAffinity(inst),
 		Containers: []corev1.Container{{
-			Name:                     "restic",
+			Name:                     "backup",
 			Image:                    image,
 			ImagePullPolicy:          corev1.PullIfNotPresent,
 			Command:                  []string{"/bin/sh"},
 			Args:                     args,
 			TerminationMessagePath:   "/dev/termination-log",
 			TerminationMessagePolicy: corev1.TerminationMessageReadFile,
-			Env: []corev1.EnvVar{
-				{Name: "RESTIC_REPOSITORY", Value: resticRepo(s3)},
-				{Name: "AWS_DEFAULT_REGION", Value: region},
-			},
-			EnvFrom: []corev1.EnvFromSource{{
-				SecretRef: &corev1.SecretEnvSource{
-					LocalObjectReference: corev1.LocalObjectReference{Name: s3CredsSecretName(inst)},
-				},
-			}},
+			Env: backupS3Env(s3,
+				corev1.EnvVar{Name: "INSTANCE_UID", Value: string(inst.UID)},
+				corev1.EnvVar{Name: "SNAPSHOT_PREFIX", Value: backupObjectPrefix(inst)},
+			),
 			VolumeMounts: []corev1.VolumeMount{
 				{Name: "data", MountPath: "/home/hermes/.hermes", ReadOnly: true},
+				{Name: "tmp", MountPath: "/tmp"},
 			},
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: Ptr(false),
@@ -127,15 +140,23 @@ tar --use-compress-program="zstd -T0 -19" -cf - -C /home/hermes/.hermes . "$META
 				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 			},
 		}},
-		Volumes: []corev1.Volume{{
-			Name: "data",
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: PVCName(inst),
-					ReadOnly:  true,
+		Volumes: []corev1.Volume{
+			{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: PVCName(inst),
+						ReadOnly:  true,
+					},
 				},
 			},
-		}},
+			{
+				Name: "tmp",
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{},
+				},
+			},
+		},
 	}
 
 	return &batchv1.CronJob{
@@ -164,21 +185,33 @@ tar --use-compress-program="zstd -T0 -19" -cf - -C /home/hermes/.hermes . "$META
 	}
 }
 
+// backupPodAffinity co-locates backup pods with the agent StatefulSet pod so
+// read/write-once PVCs can be mounted for both scheduled and one-shot backups.
+func backupPodAffinity(inst *hermesv1.HermesInstance) *corev1.Affinity {
+	return &corev1.Affinity{
+		PodAffinity: &corev1.PodAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"app.kubernetes.io/name":     "hermes-agent",
+						"app.kubernetes.io/instance": inst.Name,
+					},
+				},
+				TopologyKey: "kubernetes.io/hostname",
+			}},
+		},
+	}
+}
+
 // BuildBackupPruneCronJob returns a daily CronJob that purges old snapshots.
 //
 // The prune logic:
 //   - Lists `<prefix><ns>/<name>/*.tar.zst` sorted desc by lex timestamp.
 //   - Keeps the newest `historyLimit`; deletes the rest.
 //   - Lists `<prefix><ns>/<name>/failed/*.tar.zst` similarly with `failedHistoryLimit`.
-//
-// We run restic forget against the same repo using `--keep-last`. Restic's
-// retention is content-aware so this is robust to clock skew.
 func BuildBackupPruneCronJob(inst *hermesv1.HermesInstance) *batchv1.CronJob {
 	s3 := inst.Spec.Backup.S3
-	image := inst.Spec.Backup.Image
-	if image == "" {
-		image = ResticImage
-	}
+	image := backupImageRef(inst)
 	labels := LabelsForInstance(inst)
 	labels["hermes.agent/job-kind"] = "prune"
 
@@ -194,22 +227,12 @@ func BuildBackupPruneCronJob(inst *hermesv1.HermesInstance) *batchv1.CronJob {
 	successLim := int32(1)
 	failLim := int32(3)
 
-	region := ""
-	if s3 != nil {
-		region = s3.Region
-	}
 	backoff := int32(2)
 	ttl := int32(86400)
 
 	args := []string{
 		"-c",
-		fmt.Sprintf(
-			`set -euo pipefail
-restic --repo "$RESTIC_REPOSITORY" --no-cache forget --keep-last %d --prune --tag scheduled --tag onDelete --tag preUpdate
-restic --repo "$RESTIC_REPOSITORY" --no-cache forget --keep-last %d --prune --tag failed
-`,
-			historyLimit, failedHistoryLimit,
-		),
+		pruneBackupScript,
 	}
 
 	podSpec := corev1.PodSpec{
@@ -217,6 +240,7 @@ restic --repo "$RESTIC_REPOSITORY" --no-cache forget --keep-last %d --prune --ta
 		DNSPolicy:                     corev1.DNSClusterFirst,
 		SchedulerName:                 "default-scheduler",
 		TerminationGracePeriodSeconds: Ptr(int64(30)),
+		AutomountServiceAccountToken:  Ptr(false),
 		SecurityContext: &corev1.PodSecurityContext{
 			RunAsNonRoot:   Ptr(true),
 			RunAsUser:      Ptr(int64(1000)),
@@ -225,26 +249,32 @@ restic --repo "$RESTIC_REPOSITORY" --no-cache forget --keep-last %d --prune --ta
 			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 		},
 		Containers: []corev1.Container{{
-			Name:                     "restic",
+			Name:                     "prune",
 			Image:                    image,
 			ImagePullPolicy:          corev1.PullIfNotPresent,
 			Command:                  []string{"/bin/sh"},
 			Args:                     args,
 			TerminationMessagePath:   "/dev/termination-log",
 			TerminationMessagePolicy: corev1.TerminationMessageReadFile,
-			Env: []corev1.EnvVar{
-				{Name: "RESTIC_REPOSITORY", Value: resticRepo(s3)},
-				{Name: "AWS_DEFAULT_REGION", Value: region},
+			Env: backupS3Env(s3,
+				corev1.EnvVar{Name: "SNAPSHOT_PREFIX", Value: backupObjectPrefix(inst)},
+				corev1.EnvVar{Name: "FAILED_SNAPSHOT_PREFIX", Value: failedBackupObjectPrefix(inst)},
+				corev1.EnvVar{Name: "HISTORY_LIMIT", Value: strconv.FormatInt(int64(historyLimit), 10)},
+				corev1.EnvVar{Name: "FAILED_HISTORY_LIMIT", Value: strconv.FormatInt(int64(failedHistoryLimit), 10)},
+			),
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: "tmp", MountPath: "/tmp"},
 			},
-			EnvFrom: []corev1.EnvFromSource{{
-				SecretRef: &corev1.SecretEnvSource{
-					LocalObjectReference: corev1.LocalObjectReference{Name: s3CredsSecretName(inst)},
-				},
-			}},
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: Ptr(false),
 				ReadOnlyRootFilesystem:   Ptr(true),
 				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+			},
+		}},
+		Volumes: []corev1.Volume{{
+			Name: "tmp",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
 			},
 		}},
 	}

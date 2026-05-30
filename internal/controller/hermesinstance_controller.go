@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	hermesv1 "github.com/paperclipinc/hermes-operator/api/v1"
@@ -48,8 +49,9 @@ import (
 // HermesInstanceReconciler reconciles a HermesInstance.
 type HermesInstanceReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
+	Recorder  record.EventRecorder
 
 	// PrometheusOperatorCRDsPresent caches whether ServiceMonitor/PrometheusRule
 	// CRDs are installed. Probed once at startup by cmd/manager.
@@ -67,6 +69,9 @@ const (
 	reasonProfileStoreDisabled       = "Disabled"
 	reasonProfileStoreDeploymentDown = "DeploymentNotReady"
 	reasonProfileStoreReady          = "Ready"
+
+	conditionTypeStatefulSetReady  = "StatefulSetReady"
+	conditionTypeProfileStoreReady = "ProfileStoreReady"
 )
 
 // +kubebuilder:rbac:groups=hermes.agent,resources=hermesinstances,verbs=get;list;watch;create;update;patch;delete
@@ -138,33 +143,46 @@ func (r *HermesInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 	for _, s := range steps {
 		if err := s.fn(ctx, inst); err != nil {
-			r.setCondition(inst, s.cond, metav1.ConditionFalse, "Error", err.Error())
-			_ = r.Status().Update(ctx, inst)
+			_ = r.setSubsystemErrorCondition(ctx, inst, s.cond, s.name, err)
 			logger.Error(err, "subsystem failed", "subsystem", s.name)
 			return ctrl.Result{}, fmt.Errorf("reconcile %s: %w", s.name, err)
 		}
-		r.setCondition(inst, s.cond, metav1.ConditionTrue, "Reconciled", s.name+" up to date")
+		r.setStepSuccessCondition(inst, s.cond, s.name)
 	}
+
+	result := ctrl.Result{RequeueAfter: 5 * time.Minute}
 
 	// Sub-controller chain: backup CronJob, migration latch, restore latch, autoupdate poll.
 	if r.Backup != nil {
-		if err := r.Backup.ReconcileCronJob(ctx, inst); err != nil {
-			logger.Error(err, "backup CronJob reconcile error")
+		res, err := r.Backup.ReconcileCronJob(ctx, inst)
+		result = mergeResults(result, res)
+		if err != nil {
+			_ = r.setSubsystemErrorCondition(ctx, inst, hermesv1.ConditionBackupReady, "Backup", err)
+			return ctrl.Result{}, fmt.Errorf("backup CronJob reconcile: %w", err)
 		}
 	}
 	if r.Migration != nil {
-		if _, _, err := r.Migration.Reconcile(ctx, inst); err != nil {
-			logger.Error(err, "migration reconcile error")
+		res, _, err := r.Migration.Reconcile(ctx, inst)
+		result = mergeResults(result, res)
+		if err != nil {
+			_ = r.setSubsystemErrorCondition(ctx, inst, hermesv1.ConditionMigrationCompleted, "Migration", err)
+			return ctrl.Result{}, fmt.Errorf("migration reconcile: %w", err)
 		}
 	}
 	if r.Restore != nil {
-		if _, _, err := r.Restore.Reconcile(ctx, inst); err != nil {
-			logger.Error(err, "restore reconcile error")
+		res, _, err := r.Restore.Reconcile(ctx, inst)
+		result = mergeResults(result, res)
+		if err != nil {
+			_ = r.setSubsystemErrorCondition(ctx, inst, hermesv1.ConditionRestoreApplied, "Restore", err)
+			return ctrl.Result{}, fmt.Errorf("restore reconcile: %w", err)
 		}
 	}
 	if r.AutoUpdate != nil {
-		if _, err := r.AutoUpdate.Reconcile(ctx, inst); err != nil {
-			logger.Error(err, "autoupdate reconcile error")
+		res, err := r.AutoUpdate.Reconcile(ctx, inst)
+		result = mergeResults(result, res)
+		if err != nil {
+			_ = r.setSubsystemErrorCondition(ctx, inst, hermesv1.ConditionAutoUpdated, "AutoUpdate", err)
+			return ctrl.Result{}, fmt.Errorf("autoupdate reconcile: %w", err)
 		}
 	}
 
@@ -172,9 +190,10 @@ func (r *HermesInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	if err := r.updateStatus(ctx, inst); err != nil {
 		logger.Error(err, "status update failed")
+		return ctrl.Result{}, fmt.Errorf("update status: %w", err)
 	}
 
-	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+	return result, nil
 }
 
 // --- per-subsystem reconcilers ---
@@ -197,6 +216,9 @@ func (r *HermesInstanceReconciler) reconcileSecret(ctx context.Context, inst *he
 }
 
 func (r *HermesInstanceReconciler) reconcilePVC(ctx context.Context, inst *hermesv1.HermesInstance) error {
+	if !resources.PersistenceEnabled(inst) {
+		return nil
+	}
 	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
 		Name: resources.PVCName(inst), Namespace: inst.Namespace,
 	}}
@@ -248,16 +270,43 @@ func (r *HermesInstanceReconciler) resolveConfigBody(ctx context.Context, inst *
 }
 
 func (r *HermesInstanceReconciler) reconcileWorkspaceConfigMap(ctx context.Context, inst *hermesv1.HermesInstance) error {
+	baseData, err := r.resolveWorkspaceData(ctx, inst)
+	if err != nil {
+		return err
+	}
 	obj := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
 		Name: resources.WorkspaceConfigMapName(inst), Namespace: inst.Namespace,
 	}}
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, obj, func() error {
-		desired := resources.BuildWorkspaceConfigMap(inst)
+	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, obj, func() error {
+		desired := resources.BuildWorkspaceConfigMap(inst, baseData)
 		obj.Labels = resources.MergePreservingForeign(obj.Labels, desired.Labels, operatorLabelPrefix)
-		obj.Data = desired.Data
+		obj.Data = mergeWorkspaceData(obj.Data, desired.Data)
 		return controllerutil.SetControllerReference(inst, obj, r.Scheme)
 	})
 	return err
+}
+
+func mergeWorkspaceData(existing, desired map[string]string) map[string]string {
+	out := make(map[string]string, len(existing)+len(desired))
+	for k, v := range existing {
+		out[k] = v
+	}
+	for k, v := range desired {
+		out[k] = v
+	}
+	return out
+}
+
+func (r *HermesInstanceReconciler) resolveWorkspaceData(ctx context.Context, inst *hermesv1.HermesInstance) (map[string]string, error) {
+	if inst.Spec.Workspace.ConfigMapRef == nil {
+		return nil, nil
+	}
+	user := &corev1.ConfigMap{}
+	ref := inst.Spec.Workspace.ConfigMapRef.Name
+	if err := r.Get(ctx, types.NamespacedName{Name: ref, Namespace: inst.Namespace}, user); err != nil {
+		return nil, fmt.Errorf("resolve workspace.configMapRef %q: %w", ref, err)
+	}
+	return user.Data, nil
 }
 
 func (r *HermesInstanceReconciler) reconcileNetworkPolicy(ctx context.Context, inst *hermesv1.HermesInstance) error {
@@ -628,6 +677,73 @@ func (r *HermesInstanceReconciler) setCondition(inst *hermesv1.HermesInstance, t
 	})
 }
 
+func (r *HermesInstanceReconciler) setSubsystemErrorCondition(ctx context.Context, inst *hermesv1.HermesInstance, conditionType, subsystem string, err error) error {
+	r.setCondition(inst, conditionType, metav1.ConditionFalse, "Error", err.Error())
+	r.setCondition(inst, hermesv1.ConditionTypeReady, metav1.ConditionFalse, "SubsystemError", fmt.Sprintf("%s failed: %v", subsystem, err))
+	return r.updateInstanceStatus(ctx, inst)
+}
+
+func (r *HermesInstanceReconciler) setStepSuccessCondition(inst *hermesv1.HermesInstance, t, name string) {
+	switch t {
+	case hermesv1.ConditionTypeStorageReady:
+		if !resources.PersistenceEnabled(inst) {
+			r.setCondition(inst, t, metav1.ConditionTrue, "Disabled", "Persistence disabled; using emptyDir")
+			return
+		}
+	case hermesv1.ConditionTypeNetworkPolicyReady:
+		if !resources.BoolValueOrDefault(inst.Spec.Security.NetworkPolicy.Enabled, true) {
+			r.setCondition(inst, t, metav1.ConditionTrue, "Disabled", "NetworkPolicy disabled")
+			return
+		}
+	case hermesv1.ConditionTypeRBACReady:
+		if !resources.BoolValueOrDefault(inst.Spec.Security.RBAC.CreateServiceAccount, true) {
+			r.setCondition(inst, t, metav1.ConditionTrue, "Disabled", "Operator-created ServiceAccount disabled")
+			return
+		}
+	case hermesv1.ConditionTypePDBReady:
+		if !resources.BoolValue(inst.Spec.Availability.PodDisruptionBudget.Enabled) {
+			r.setCondition(inst, t, metav1.ConditionTrue, "Disabled", "PodDisruptionBudget disabled")
+			return
+		}
+	case hermesv1.ConditionTypeHPAReady:
+		if !resources.IsHPAEnabled(inst) {
+			r.setCondition(inst, t, metav1.ConditionTrue, "Disabled", "HorizontalPodAutoscaler disabled")
+			return
+		}
+	case hermesv1.ConditionTypeIngressReady:
+		if !resources.BoolValue(inst.Spec.Networking.Ingress.Enabled) {
+			r.setCondition(inst, t, metav1.ConditionTrue, "Disabled", "Ingress disabled")
+			return
+		}
+	case hermesv1.ConditionTypeServiceMonitorReady:
+		if !r.PrometheusOperatorCRDsPresent || !resources.BoolValue(inst.Spec.Observability.ServiceMonitor.Enabled) {
+			r.setCondition(inst, t, metav1.ConditionTrue, "Disabled", "ServiceMonitor disabled or CRD unavailable")
+			return
+		}
+	case hermesv1.ConditionTypePrometheusRuleReady:
+		if !r.PrometheusOperatorCRDsPresent || !resources.BoolValue(inst.Spec.Observability.PrometheusRule.Enabled) {
+			r.setCondition(inst, t, metav1.ConditionTrue, "Disabled", "PrometheusRule disabled or CRD unavailable")
+			return
+		}
+	case conditionTypeProfileStoreReady:
+		if !resources.BoolValue(inst.Spec.ProfileStore.Honcho.Enabled) {
+			r.setCondition(inst, t, metav1.ConditionTrue, reasonProfileStoreDisabled, "Honcho profile store disabled")
+			return
+		}
+	}
+	r.setCondition(inst, t, metav1.ConditionTrue, "Reconciled", name+" up to date")
+}
+
+func mergeResults(current, next ctrl.Result) ctrl.Result {
+	if next.Requeue {
+		current.Requeue = true
+	}
+	if next.RequeueAfter > 0 && (current.RequeueAfter == 0 || next.RequeueAfter < current.RequeueAfter) {
+		current.RequeueAfter = next.RequeueAfter
+	}
+	return current
+}
+
 func (r *HermesInstanceReconciler) updateStatus(ctx context.Context, inst *hermesv1.HermesInstance) error {
 	sts := &appsv1.StatefulSet{}
 	if err := r.Get(ctx, types.NamespacedName{Name: resources.StatefulSetName(inst), Namespace: inst.Namespace}, sts); err != nil {
@@ -636,17 +752,114 @@ func (r *HermesInstanceReconciler) updateStatus(ctx context.Context, inst *herme
 	inst.Status.Replicas = sts.Status.Replicas
 	inst.Status.ReadyReplicas = sts.Status.ReadyReplicas
 	inst.Status.ObservedGeneration = inst.Generation
+	r.setStatefulSetCondition(inst, sts)
+
 	switch {
 	case inst.Spec.Suspended:
 		inst.Status.Phase = "Suspended"
-	case sts.Status.ReadyReplicas > 0 && sts.Status.ReadyReplicas == sts.Status.Replicas:
+		r.setCondition(inst, hermesv1.ConditionTypeReady, metav1.ConditionFalse, "Suspended", "Suspended by spec.suspended=true")
+	case isInstanceReady(inst):
 		inst.Status.Phase = "Ready"
-		r.setCondition(inst, hermesv1.ConditionTypeReady, metav1.ConditionTrue, "AllSubsystemsReady", "")
+		r.setCondition(inst, hermesv1.ConditionTypeReady, metav1.ConditionTrue, "AllSubsystemsReady", "All active subsystems are ready")
 	default:
 		inst.Status.Phase = "Pending"
-		r.setCondition(inst, hermesv1.ConditionTypeReady, metav1.ConditionFalse, "StatefulSetNotReady", "")
+		failing := failingRequiredConditions(inst)
+		r.setCondition(inst, hermesv1.ConditionTypeReady, metav1.ConditionFalse, "SubsystemsPending", "Waiting for: "+strings.Join(failing, ", "))
 	}
-	return r.Status().Update(ctx, inst)
+	return r.updateInstanceStatus(ctx, inst)
+}
+
+func (r *HermesInstanceReconciler) updateInstanceStatus(ctx context.Context, inst *hermesv1.HermesInstance) error {
+	latest := &hermesv1.HermesInstance{}
+	reader := client.Reader(r.Client)
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+	if err := reader.Get(ctx, types.NamespacedName{Name: inst.Name, Namespace: inst.Namespace}, latest); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	latest.Status = inst.Status
+	return r.Status().Update(ctx, latest)
+}
+
+func (r *HermesInstanceReconciler) setStatefulSetCondition(inst *hermesv1.HermesInstance, sts *appsv1.StatefulSet) {
+	if sts.Status.Replicas > 0 && sts.Status.ReadyReplicas == sts.Status.Replicas {
+		r.setCondition(inst, conditionTypeStatefulSetReady, metav1.ConditionTrue, "Ready", "StatefulSet replicas are ready")
+		return
+	}
+	if inst.Spec.Suspended {
+		r.setCondition(inst, conditionTypeStatefulSetReady, metav1.ConditionFalse, "Suspended", "StatefulSet scaled to zero by spec.suspended=true")
+		return
+	}
+	r.setCondition(inst, conditionTypeStatefulSetReady, metav1.ConditionFalse, "StatefulSetNotReady",
+		fmt.Sprintf("StatefulSet has %d/%d ready replicas", sts.Status.ReadyReplicas, sts.Status.Replicas))
+}
+
+func isInstanceReady(inst *hermesv1.HermesInstance) bool {
+	return len(failingRequiredConditions(inst)) == 0
+}
+
+func failingRequiredConditions(inst *hermesv1.HermesInstance) []string {
+	var failing []string
+	for _, conditionType := range requiredConditionTypes(inst) {
+		condition := meta.FindStatusCondition(inst.Status.Conditions, conditionType)
+		if condition == nil || condition.Status != metav1.ConditionTrue || condition.ObservedGeneration != inst.Generation {
+			failing = append(failing, conditionType)
+		}
+	}
+	return failing
+}
+
+func requiredConditionTypes(inst *hermesv1.HermesInstance) []string {
+	required := []string{
+		hermesv1.ConditionTypeConfigReady,
+		hermesv1.ConditionTypeSecretsReady,
+		hermesv1.ConditionTypeServiceReady,
+		conditionTypeStatefulSetReady,
+	}
+	if resources.PersistenceEnabled(inst) {
+		required = append(required, hermesv1.ConditionTypeStorageReady)
+	}
+	if resources.BoolValueOrDefault(inst.Spec.Security.NetworkPolicy.Enabled, true) {
+		required = append(required, hermesv1.ConditionTypeNetworkPolicyReady)
+	}
+	if resources.BoolValueOrDefault(inst.Spec.Security.RBAC.CreateServiceAccount, true) {
+		required = append(required, hermesv1.ConditionTypeRBACReady)
+	}
+	if resources.BoolValue(inst.Spec.Availability.PodDisruptionBudget.Enabled) {
+		required = append(required, hermesv1.ConditionTypePDBReady)
+	}
+	if resources.IsHPAEnabled(inst) {
+		required = append(required, hermesv1.ConditionTypeHPAReady)
+	}
+	if resources.BoolValue(inst.Spec.Networking.Ingress.Enabled) {
+		required = append(required, hermesv1.ConditionTypeIngressReady)
+	}
+	if resources.BoolValue(inst.Spec.Observability.ServiceMonitor.Enabled) {
+		required = append(required, hermesv1.ConditionTypeServiceMonitorReady)
+	}
+	if resources.BoolValue(inst.Spec.Observability.PrometheusRule.Enabled) {
+		required = append(required, hermesv1.ConditionTypePrometheusRuleReady)
+	}
+	if resources.BoolValue(inst.Spec.ProfileStore.Honcho.Enabled) {
+		required = append(required, conditionTypeProfileStoreReady)
+	}
+	if inst.Spec.Backup.Schedule != "" || inst.Spec.Backup.OnDelete || inst.Status.Backup.FinalBackupJobName != "" {
+		required = append(required, hermesv1.ConditionBackupReady)
+	}
+	if inst.Spec.RestoreFrom != "" || inst.Status.RestoredFrom != "" {
+		required = append(required, hermesv1.ConditionRestoreApplied)
+	}
+	if inst.Spec.Migration.FromOpenClaw != nil || inst.Status.Migration.Completed {
+		required = append(required, hermesv1.ConditionMigrationCompleted)
+	}
+	if inst.Spec.AutoUpdate.Enabled || inst.Status.AutoUpdate.TargetTag != "" {
+		required = append(required, hermesv1.ConditionAutoUpdated)
+	}
+	return required
 }
 
 // SetupWithManager wires watches for every owned type.

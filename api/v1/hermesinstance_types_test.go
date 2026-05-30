@@ -48,6 +48,17 @@ func TestConfigSpec_RawAndRef(t *testing.T) {
 	assert.Equal(t, ConfigMergeModeMerge, cs.MergeMode)
 }
 
+func TestImageRepositoryUsesDigestRequiresFullSHA256(t *testing.T) {
+	t.Parallel()
+
+	valid := "ghcr.io/paperclipinc/hermes-agent@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	assert.True(t, ImageRepositoryUsesDigest(valid))
+
+	assert.False(t, ImageRepositoryUsesDigest("ghcr.io/paperclipinc/hermes-agent@sha256:bad"))
+	assert.False(t, ImageRepositoryUsesDigest(valid+":extra"))
+	assert.False(t, ImageRepositoryUsesDigest("ghcr.io/paperclipinc/hermes-agent:v1.0.0"))
+}
+
 func TestWorkspaceSpec_NestedPath(t *testing.T) {
 	t.Parallel()
 	ws := WorkspaceSpec{
@@ -94,17 +105,19 @@ func TestSecuritySpec_Shape(t *testing.T) {
 			},
 		},
 		NetworkPolicy: NetworkPolicySpec{
-			Enabled:                  Ptr(true),
-			AllowDNS:                 Ptr(true),
-			AllowedIngressNamespaces: []string{"prometheus"},
-			AllowedIngressCIDRs:      []string{"10.0.0.0/8"},
-			AllowedEgressCIDRs:       []string{"203.0.113.0/24"},
+			Enabled:                   Ptr(true),
+			AllowDNS:                  Ptr(true),
+			AllowSameNamespaceIngress: Ptr(true),
+			AllowedIngressNamespaces:  []string{"prometheus"},
+			AllowedIngressCIDRs:       []string{"10.0.0.0/8"},
+			AllowedEgressCIDRs:        []string{"203.0.113.0/24"},
 		},
 		CABundle: CABundleSpec{ConfigMapName: "corp-ca", Key: "ca.crt"},
 	}
 	assert.True(t, *ss.PodSecurityContext.RunAsNonRoot)
 	assert.True(t, *ss.RBAC.CreateServiceAccount)
 	assert.True(t, *ss.NetworkPolicy.Enabled)
+	assert.True(t, *ss.NetworkPolicy.AllowSameNamespaceIngress)
 	assert.Equal(t, "corp-ca", ss.CABundle.ConfigMapName)
 }
 

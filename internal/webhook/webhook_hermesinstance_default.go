@@ -55,6 +55,9 @@ func ApplyClusterDefaults(inst *hermesv1.HermesInstance, hcd *hermesv1.HermesClu
 	if inst.Spec.Storage.Persistence.Size == "" {
 		inst.Spec.Storage.Persistence.Size = hcd.Spec.Storage.Persistence.Size
 	}
+	if inst.Spec.Storage.Persistence.Enabled == nil {
+		inst.Spec.Storage.Persistence.Enabled = hcd.Spec.Storage.Persistence.Enabled
+	}
 	if inst.Spec.Storage.Persistence.StorageClassName == nil {
 		inst.Spec.Storage.Persistence.StorageClassName = hcd.Spec.Storage.Persistence.StorageClassName
 	}
@@ -70,10 +73,16 @@ func ApplyClusterDefaults(inst *hermesv1.HermesInstance, hcd *hermesv1.HermesClu
 		inst.Spec.Security.RBAC.Annotations = hcd.Spec.Security.ServiceAccount.Annotations
 	}
 	if inst.Spec.Security.NetworkPolicy.Enabled == nil {
-		inst.Spec.Security.NetworkPolicy.Enabled = hcd.Spec.Security.NetworkPolicy.Enabled
+		inst.Spec.Security.NetworkPolicy.Enabled = firstBool(hcd.Spec.Security.NetworkPolicy.Enabled, hcd.Spec.Networking.NetworkPolicy.Enabled)
 	}
 	if inst.Spec.Security.NetworkPolicy.AllowDNS == nil {
-		inst.Spec.Security.NetworkPolicy.AllowDNS = hcd.Spec.Security.NetworkPolicy.AllowDNS
+		inst.Spec.Security.NetworkPolicy.AllowDNS = firstBool(hcd.Spec.Security.NetworkPolicy.AllowDNS, hcd.Spec.Networking.NetworkPolicy.AllowDNS)
+	}
+	if inst.Spec.Security.NetworkPolicy.AllowSameNamespaceIngress == nil {
+		inst.Spec.Security.NetworkPolicy.AllowSameNamespaceIngress = firstBool(
+			hcd.Spec.Security.NetworkPolicy.AllowSameNamespaceIngress,
+			hcd.Spec.Networking.NetworkPolicy.AllowSameNamespaceIngress,
+		)
 	}
 	if inst.Spec.Security.CABundle.ConfigMapName == "" && inst.Spec.Security.CABundle.SecretName == "" {
 		inst.Spec.Security.CABundle = hcd.Spec.Security.CABundle
@@ -104,4 +113,13 @@ func ApplyClusterDefaults(inst *hermesv1.HermesInstance, hcd *hermesv1.HermesClu
 	if inst.Spec.Observability.Logging.Level == "" {
 		inst.Spec.Observability.Logging.Level = hcd.Spec.Observability.Logging.Level
 	}
+}
+
+func firstBool(values ...*bool) *bool {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
 }

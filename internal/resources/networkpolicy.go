@@ -62,16 +62,18 @@ func buildIngressRules(inst *hermesv1.HermesInstance) []networkingv1.NetworkPoli
 	rules := []networkingv1.NetworkPolicyIngressRule{}
 	ports := networkPolicyIngressPorts(inst)
 
-	rules = append(rules, networkingv1.NetworkPolicyIngressRule{
-		From: []networkingv1.NetworkPolicyPeer{
-			{
-				NamespaceSelector: &metav1.LabelSelector{
-					MatchLabels: map[string]string{"kubernetes.io/metadata.name": inst.Namespace},
+	if BoolValueOrDefault(inst.Spec.Security.NetworkPolicy.AllowSameNamespaceIngress, false) {
+		rules = append(rules, networkingv1.NetworkPolicyIngressRule{
+			From: []networkingv1.NetworkPolicyPeer{
+				{
+					NamespaceSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"kubernetes.io/metadata.name": inst.Namespace},
+					},
 				},
 			},
-		},
-		Ports: ports,
-	})
+			Ports: ports,
+		})
+	}
 
 	for _, ns := range inst.Spec.Security.NetworkPolicy.AllowedIngressNamespaces {
 		rules = append(rules, networkingv1.NetworkPolicyIngressRule{
@@ -112,13 +114,6 @@ func buildEgressRules(inst *hermesv1.HermesInstance) []networkingv1.NetworkPolic
 		})
 	}
 
-	rules = append(rules, networkingv1.NetworkPolicyEgressRule{
-		To: []networkingv1.NetworkPolicyPeer{},
-		Ports: []networkingv1.NetworkPolicyPort{
-			{Protocol: Ptr(corev1.ProtocolTCP), Port: Ptr(intstr.FromInt(443))},
-		},
-	})
-
 	for _, cidr := range inst.Spec.Security.NetworkPolicy.AllowedEgressCIDRs {
 		rules = append(rules, networkingv1.NetworkPolicyEgressRule{
 			To: []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: cidr}}},
@@ -131,23 +126,13 @@ func buildEgressRules(inst *hermesv1.HermesInstance) []networkingv1.NetworkPolic
 	return rules
 }
 
-// ExtraEgressRules returns the per-instance egress rules driven by spec.gateways
-// and spec.profileStore. Plan 2's base default-deny baseline opens DNS + TCP/443
-// already; these rules add (1) explicit per-gateway endpoints (still TCP/443
-// but documented per gateway) and (2) egress to the Honcho sibling pod on
-// TCP/8000 when ProfileStore.Honcho is enabled.
+// ExtraEgressRules returns per-instance egress rules that cannot be expressed by
+// the base NetworkPolicy defaults. Gateway FQDNs are intentionally not emitted
+// as broad TCP/443 rules; users must supply explicit CIDR or CNI-specific
+// policies until portable FQDN policies exist. Honcho keeps an explicit sibling
+// pod rule when ProfileStore.Honcho is enabled.
 func ExtraEgressRules(inst *hermesv1.HermesInstance) []networkingv1.NetworkPolicyEgressRule {
 	var rules []networkingv1.NetworkPolicyEgressRule
-
-	if endpoints := BuildGatewayEgressEndpoints(inst); len(endpoints) > 0 {
-		port443 := intstr.FromInt(443)
-		tcp := corev1.ProtocolTCP
-		rules = append(rules, networkingv1.NetworkPolicyEgressRule{
-			// No `To` => all destinations. Hostname-level allow-listing is a
-			// CNI-implementation concern; see docs/conventions.md.
-			Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &port443}},
-		})
-	}
 
 	if honchoEnabled(inst) {
 		port8000 := intstr.FromInt(8000)

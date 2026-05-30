@@ -66,6 +66,33 @@ func ServiceAccountNameFor(inst *hermesv1.HermesInstance) string {
 	return inst.Name
 }
 
+func PersistenceEnabled(inst *hermesv1.HermesInstance) bool {
+	return BoolValueOrDefault(inst.Spec.Storage.Persistence.Enabled, true)
+}
+
+func MetricsEnabled(inst *hermesv1.HermesInstance) bool {
+	return BoolValueOrDefault(inst.Spec.Observability.Metrics.Enabled, true)
+}
+
+func EffectiveMetricsPort(inst *hermesv1.HermesInstance) int32 {
+	if inst.Spec.Observability.Metrics.Port != 0 {
+		return inst.Spec.Observability.Metrics.Port
+	}
+	return DefaultMetricsPort
+}
+
+func EffectiveAgentTag(inst *hermesv1.HermesInstance) string {
+	if inst.Spec.AutoUpdate.Enabled {
+		if inst.Status.AutoUpdate.TargetTag != "" {
+			return inst.Status.AutoUpdate.TargetTag
+		}
+		if inst.Status.AutoUpdate.CurrentTag != "" {
+			return inst.Status.AutoUpdate.CurrentTag
+		}
+	}
+	return inst.Spec.Image.Tag
+}
+
 // BoolValue dereferences a *bool, returning false on nil.
 func BoolValue(b *bool) bool {
 	if b == nil {

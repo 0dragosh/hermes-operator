@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strings"
+	"unicode"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -31,6 +34,13 @@ func Ptr[T any](v T) *T { return &v }
 // intOrStr is a test/internal helper.
 func intOrStr(s string) intstr.IntOrString { return intstr.FromString(s) }
 
+var (
+	s3BucketNameRE  = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]*[a-z0-9]$`)
+	workspacePathRE = regexp.MustCompile(`^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$`)
+)
+
+const s3ShellMetacharacters = ";&|<>()$`\\\"'{}[]*?!#"
+
 // ValidateCreate runs the full sanity ruleset on a fresh resource.
 func (v *HermesInstanceValidator) ValidateCreate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
 	inst, ok := obj.(*hermesv1.HermesInstance)
@@ -40,6 +50,9 @@ func (v *HermesInstanceValidator) ValidateCreate(ctx context.Context, obj runtim
 	errs := field.ErrorList{}
 	errs = append(errs, validateRestoreMigrationMutualExclusion(inst)...)
 	errs = append(errs, validateMigrationSourceExactlyOne(inst)...)
+	errs = append(errs, validateS3Fields(inst)...)
+	errs = append(errs, validateWorkspacePaths(inst)...)
+	errs = append(errs, validateAdmissionGuardrails(inst)...)
 	warnings := v.crossCheckSecrets(ctx, inst)
 	if len(errs) > 0 {
 		return warnings, errs.ToAggregate()
@@ -68,6 +81,9 @@ func (v *HermesInstanceValidator) ValidateUpdate(ctx context.Context, oldObj, ne
 	errs = append(errs, validateImmutableTerminals(oldI, newI)...)
 	errs = append(errs, validateRestoreMigrationMutualExclusion(newI)...)
 	errs = append(errs, validateMigrationSourceExactlyOne(newI)...)
+	errs = append(errs, validateS3Fields(newI)...)
+	errs = append(errs, validateWorkspacePaths(newI)...)
+	errs = append(errs, validateAdmissionGuardrails(newI)...)
 	warnings := v.crossCheckSecrets(ctx, newI)
 	if len(errs) > 0 {
 		return warnings, errs.ToAggregate()
@@ -91,6 +107,160 @@ func (v *HermesInstanceValidator) ValidateUpdate(ctx context.Context, oldObj, ne
 // ValidateDelete is a no-op.
 func (v *HermesInstanceValidator) ValidateDelete(_ context.Context, _ runtime.Object) (admission.Warnings, error) {
 	return nil, nil
+}
+
+func validateS3Fields(inst *hermesv1.HermesInstance) field.ErrorList {
+	errs := field.ErrorList{}
+	if inst.Spec.Backup.S3 != nil {
+		s3 := inst.Spec.Backup.S3
+		path := field.NewPath("spec", "backup", "s3")
+		errs = append(errs, validateS3Bucket(path.Child("bucket"), s3.Bucket)...)
+		errs = append(errs, validateS3Endpoint(path.Child("endpoint"), s3.Endpoint)...)
+		if s3.PathPrefix != "" {
+			errs = append(errs, validateS3ObjectKey(path.Child("pathPrefix"), s3.PathPrefix)...)
+		}
+	}
+
+	fc := inst.Spec.Migration.FromOpenClaw
+	if fc != nil && fc.Source.BackupRef != nil {
+		s3 := fc.Source.BackupRef.S3
+		path := field.NewPath("spec", "migration", "fromOpenClaw", "source", "backupRef", "s3")
+		errs = append(errs, validateS3Bucket(path.Child("bucket"), s3.Bucket)...)
+		errs = append(errs, validateS3Endpoint(path.Child("endpoint"), s3.Endpoint)...)
+		errs = append(errs, validateS3ObjectKey(path.Child("key"), s3.Key)...)
+	}
+	return errs
+}
+
+func validateWorkspacePaths(inst *hermesv1.HermesInstance) field.ErrorList {
+	errs := field.ErrorList{}
+	filesPath := field.NewPath("spec", "workspace", "initialFiles")
+	for i, file := range inst.Spec.Workspace.InitialFiles {
+		errs = append(errs, validateWorkspaceRelativePath(filesPath.Index(i).Child("path"), file.Path, 4096)...)
+	}
+	dirsPath := field.NewPath("spec", "workspace", "initialDirs")
+	for i, dir := range inst.Spec.Workspace.InitialDirs {
+		errs = append(errs, validateWorkspaceRelativePath(dirsPath.Index(i), dir, 4096)...)
+	}
+	return errs
+}
+
+func validateWorkspaceRelativePath(path *field.Path, value string, maxLength int) field.ErrorList {
+	errs := field.ErrorList{}
+	if value == "" {
+		return field.ErrorList{field.Required(path, "workspace path is required")}
+	}
+	if len(value) > maxLength {
+		errs = append(errs, field.TooLong(path, value, maxLength))
+	}
+	if strings.HasPrefix(value, "/") || strings.HasSuffix(value, "/") {
+		errs = append(errs, field.Invalid(path, value, "must be a relative path without leading or trailing slash"))
+	}
+	if !workspacePathRE.MatchString(value) {
+		errs = append(errs, field.Invalid(path, value, "must contain only letters, digits, dot, hyphen, underscore, and slash separators"))
+	}
+	for _, segment := range strings.Split(value, "/") {
+		if segment == "." || segment == ".." {
+			errs = append(errs, field.Invalid(path, value, "must not contain dot segments"))
+			break
+		}
+	}
+	return errs
+}
+
+func validateS3Bucket(path *field.Path, bucket string) field.ErrorList {
+	if bucket == "" {
+		return field.ErrorList{field.Required(path, "bucket is required when S3 is configured")}
+	}
+	if len(bucket) < 3 || len(bucket) > 63 {
+		return field.ErrorList{field.Invalid(path, bucket, "must be between 3 and 63 characters")}
+	}
+	if !s3BucketNameRE.MatchString(bucket) {
+		return field.ErrorList{field.Invalid(path, bucket, "must start and end with a lowercase letter or digit and contain only lowercase letters, digits, dots, or hyphens")}
+	}
+	return nil
+}
+
+func validateS3Endpoint(path *field.Path, endpoint string) field.ErrorList {
+	errs := field.ErrorList{}
+	if endpoint == "" {
+		return field.ErrorList{field.Required(path, "endpoint is required when S3 is configured")}
+	}
+	if len(endpoint) > 253 {
+		errs = append(errs, field.TooLong(path, endpoint, 253))
+	}
+	if containsControl(endpoint) {
+		errs = append(errs, field.Invalid(path, endpoint, "must not contain control characters"))
+	}
+	if containsWhitespace(endpoint) {
+		errs = append(errs, field.Invalid(path, endpoint, "must not contain whitespace"))
+	}
+	if containsShellMetacharacter(endpoint) {
+		errs = append(errs, field.Invalid(path, endpoint, "must not contain shell metacharacters"))
+	}
+	if containsDotDotSegment(endpoint) {
+		errs = append(errs, field.Invalid(path, endpoint, "must not contain '..' path segments"))
+	}
+	return errs
+}
+
+func validateS3ObjectKey(path *field.Path, key string) field.ErrorList {
+	errs := field.ErrorList{}
+	if key == "" {
+		return field.ErrorList{field.Required(path, "object key is required when S3 is configured")}
+	}
+	if len(key) > 1024 {
+		errs = append(errs, field.TooLong(path, key, 1024))
+	}
+	if containsControl(key) {
+		errs = append(errs, field.Invalid(path, key, "must not contain control characters"))
+	}
+	if containsShellMetacharacter(key) {
+		errs = append(errs, field.Invalid(path, key, "must not contain shell metacharacters"))
+	}
+	if containsDotDotSegment(key) {
+		errs = append(errs, field.Invalid(path, key, "must not contain '..' path segments"))
+	}
+	return errs
+}
+
+func containsControl(value string) bool {
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsWhitespace(value string) bool {
+	for _, r := range value {
+		if unicode.IsSpace(r) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsShellMetacharacter(value string) bool {
+	for _, r := range value {
+		if strings.ContainsRune(s3ShellMetacharacters, r) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsDotDotSegment(value string) bool {
+	segments := strings.FieldsFunc(value, func(r rune) bool {
+		return r == '/' || r == '\\'
+	})
+	for _, segment := range segments {
+		if segment == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 func (v *HermesInstanceValidator) validateGateways(ctx context.Context, inst *hermesv1.HermesInstance) (admission.Warnings, error) {
@@ -172,6 +342,17 @@ func validateCommon(inst *hermesv1.HermesInstance) (admission.Warnings, error) {
 
 	if inst.Spec.Image.Repository == "" {
 		return warns, fmt.Errorf("spec.image.repository is required (set on the instance or via HermesClusterDefaults)")
+	}
+	if strings.Contains(inst.Spec.Image.Repository, "@sha256:") && !hermesv1.ImageRepositoryUsesDigest(inst.Spec.Image.Repository) {
+		return warns, fmt.Errorf("spec.image.repository digest references must use @sha256:<64 lowercase hex chars>")
+	}
+	if !hermesv1.ImageRepositoryUsesDigest(inst.Spec.Image.Repository) {
+		if inst.Spec.Image.Tag == "" {
+			return warns, fmt.Errorf("spec.image.tag is required for tag-based images (set a concrete tag or pin spec.image.repository by digest)")
+		}
+		if inst.Spec.Image.Tag == "latest" {
+			return warns, fmt.Errorf("spec.image.tag must not be \"latest\" for tag-based images (set a concrete tag or pin spec.image.repository by digest)")
+		}
 	}
 	if inst.Spec.Storage.Persistence.Size == "" {
 		return warns, fmt.Errorf("spec.storage.persistence.size is required")
@@ -303,7 +484,7 @@ func (v *HermesInstanceValidator) crossCheckSecrets(ctx context.Context, inst *h
 			}
 		}
 	}
-	if inst.Spec.AutoUpdate.Enabled && inst.Spec.Image.Tag == "latest" {
+	if inst.Spec.AutoUpdate.Enabled && inst.Spec.Image.Tag == "latest" && !hermesv1.ImageRepositoryUsesDigest(inst.Spec.Image.Repository) {
 		warnings = append(warnings, "spec.autoUpdate.enabled with spec.image.tag=\"latest\": the operator will resolve to a concrete tag, but please pin spec.image.tag for GitOps deterministic apply")
 	}
 	return warnings

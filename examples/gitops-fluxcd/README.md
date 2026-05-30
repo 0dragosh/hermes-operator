@@ -54,8 +54,8 @@ Field manager `kustomize-controller`:
 Field manager `hermes.agent/selfconfig`:
 
 - `spec.config.raw.schedules`
-- `spec.runtime.extraPip`
-- `spec.workspace.files` entries under `notes/` and `learned/`
+- `spec.runtime.extraPipPackages`
+- `spec.workspace.initialFiles` entries under `notes/` and `learned/`
 - `spec.env` entries for `FINANCE_TZ`, `LEARNED_*`
 
 These match `spec.selfConfigure.allowedActions` and the **complement** of

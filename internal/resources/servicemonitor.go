@@ -35,8 +35,21 @@ func BuildServiceMonitor(inst *hermesv1.HermesInstance) *unstructured.Unstructur
 		scrapeTimeout = "10s"
 	}
 	scheme := "http"
-	if BoolValue(inst.Spec.Observability.Metrics.Secure) {
+	if BoolValueOrDefault(inst.Spec.Observability.Metrics.Secure, true) {
 		scheme = "https"
+	}
+	endpoint := map[string]interface{}{
+		"port":          MetricsPortName,
+		"interval":      interval,
+		"scrapeTimeout": scrapeTimeout,
+		"path":          "/metrics",
+		"scheme":        scheme,
+	}
+	if scheme == "https" {
+		endpoint["bearerTokenFile"] = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+		endpoint["tlsConfig"] = map[string]interface{}{
+			"insecureSkipVerify": true,
+		}
 	}
 
 	return &unstructured.Unstructured{
@@ -53,13 +66,7 @@ func BuildServiceMonitor(inst *hermesv1.HermesInstance) *unstructured.Unstructur
 					"matchLabels": toIface(SelectorLabels(inst)),
 				},
 				"endpoints": []interface{}{
-					map[string]interface{}{
-						"port":          MetricsPortName,
-						"interval":      interval,
-						"scrapeTimeout": scrapeTimeout,
-						"path":          "/metrics",
-						"scheme":        scheme,
-					},
+					endpoint,
 				},
 			},
 		},

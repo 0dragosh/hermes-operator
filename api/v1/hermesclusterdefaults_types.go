@@ -135,6 +135,9 @@ type NetworkPolicyDefaults struct {
 
 	// +optional
 	AllowDNS *bool `json:"allowDNS,omitempty"`
+
+	// +optional
+	AllowSameNamespaceIngress *bool `json:"allowSameNamespaceIngress,omitempty"`
 }
 
 // NetworkingDefaults mirrors the defaultable subset of NetworkingSpec.

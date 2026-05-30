@@ -73,11 +73,8 @@ func buildServicePorts(inst *hermesv1.HermesInstance) []corev1.ServicePort {
 			Protocol:   corev1.ProtocolTCP,
 		})
 	}
-	if BoolValueOrDefault(inst.Spec.Observability.Metrics.Enabled, true) {
-		port := inst.Spec.Observability.Metrics.Port
-		if port == 0 {
-			port = DefaultMetricsPort
-		}
+	if MetricsEnabled(inst) {
+		port := EffectiveMetricsPort(inst)
 		seen := false
 		for _, p := range ports {
 			if p.Name == MetricsPortName {

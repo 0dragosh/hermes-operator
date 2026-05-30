@@ -31,6 +31,57 @@ func TestBuildStatefulSet_ContainerImage(t *testing.T) {
 	assert.Equal(t, corev1.PullIfNotPresent, require[0].ImagePullPolicy, "explicit default")
 }
 
+func TestBuildStatefulSet_ContainerImageDoesNotUseTagDefault(t *testing.T) {
+	t.Parallel()
+	inst := minimalInstance()
+	inst.Spec.Image.Tag = ""
+
+	sts := BuildStatefulSet(inst, nil)
+
+	require.Len(t, sts.Spec.Template.Spec.Containers, 1)
+	assert.Equal(t, "ghcr.io/paperclipinc/hermes-agent:", sts.Spec.Template.Spec.Containers[0].Image)
+}
+
+func TestBuildStatefulSet_ContainerImageUsesDigestWithoutAppendingTag(t *testing.T) {
+	t.Parallel()
+	inst := minimalInstance()
+	inst.Spec.Image.Repository = "ghcr.io/paperclipinc/hermes-agent@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+	sts := BuildStatefulSet(inst, nil)
+
+	require.Len(t, sts.Spec.Template.Spec.Containers, 1)
+	assert.Equal(t, inst.Spec.Image.Repository, sts.Spec.Template.Spec.Containers[0].Image)
+}
+
+func TestBuildStatefulSet_ContainerImageUsesAutoUpdateTargetTag(t *testing.T) {
+	t.Parallel()
+	inst := minimalInstance()
+	inst.Spec.Image.Repository = "ghcr.io/paperclipinc/hermes-agent"
+	inst.Spec.Image.Tag = "v1.0.0"
+	inst.Spec.AutoUpdate.Enabled = true
+	inst.Status.AutoUpdate.CurrentTag = "v1.0.0"
+	inst.Status.AutoUpdate.TargetTag = "v1.1.0"
+
+	sts := BuildStatefulSet(inst, nil)
+
+	require.Len(t, sts.Spec.Template.Spec.Containers, 1)
+	assert.Equal(t, "ghcr.io/paperclipinc/hermes-agent:v1.1.0", sts.Spec.Template.Spec.Containers[0].Image)
+}
+
+func TestBuildStatefulSet_ContainerImageUsesAutoUpdateCurrentTag(t *testing.T) {
+	t.Parallel()
+	inst := minimalInstance()
+	inst.Spec.Image.Repository = "ghcr.io/paperclipinc/hermes-agent"
+	inst.Spec.Image.Tag = "v1.0.0"
+	inst.Spec.AutoUpdate.Enabled = true
+	inst.Status.AutoUpdate.CurrentTag = "v1.0.1"
+
+	sts := BuildStatefulSet(inst, nil)
+
+	require.Len(t, sts.Spec.Template.Spec.Containers, 1)
+	assert.Equal(t, "ghcr.io/paperclipinc/hermes-agent:v1.0.1", sts.Spec.Template.Spec.Containers[0].Image)
+}
+
 func TestBuildStatefulSet_ExplicitK8sDefaults(t *testing.T) {
 	sts := BuildStatefulSet(minimalInstance(), nil)
 	podSpec := sts.Spec.Template.Spec
@@ -74,9 +125,78 @@ func TestBuildStatefulSet_VolumesAndMounts(t *testing.T) {
 	assert.Equal(t, "/tmp", mountNames["tmp"], "writable /tmp for read-only rootfs")
 }
 
+func TestBuildStatefulSet_DefaultDataVolumeUsesPVC(t *testing.T) {
+	t.Parallel()
+	inst := minimalInstance()
+	sts := BuildStatefulSet(inst, nil)
+
+	data := volumeByName(sts.Spec.Template.Spec.Volumes, "data")
+	require.NotNil(t, data)
+	require.NotNil(t, data.PersistentVolumeClaim)
+	assert.Equal(t, PVCName(inst), data.PersistentVolumeClaim.ClaimName)
+	assert.Nil(t, data.EmptyDir)
+}
+
+func TestBuildStatefulSet_DisabledPersistenceUsesEmptyDir(t *testing.T) {
+	t.Parallel()
+	inst := minimalInstance()
+	inst.Spec.Storage.Persistence.Enabled = Ptr(false)
+	sts := BuildStatefulSet(inst, nil)
+
+	data := volumeByName(sts.Spec.Template.Spec.Volumes, "data")
+	require.NotNil(t, data)
+	require.NotNil(t, data.EmptyDir)
+	assert.Nil(t, data.PersistentVolumeClaim)
+}
+
+func TestBuildStatefulSet_DataMountPathUnaffectedByPersistenceMode(t *testing.T) {
+	t.Parallel()
+	inst := minimalInstance()
+	inst.Spec.Storage.Persistence.Enabled = Ptr(false)
+	sts := BuildStatefulSet(inst, nil)
+
+	mount := volumeMountByName(sts.Spec.Template.Spec.Containers[0].VolumeMounts, "data")
+	require.NotNil(t, mount)
+	assert.Equal(t, "/home/hermes/.hermes", mount.MountPath)
+}
+
+func TestBuildStatefulSet_MetricsPortMatchesServiceTarget(t *testing.T) {
+	t.Parallel()
+	inst := minimalInstance()
+	inst.Spec.Observability.Metrics.Port = 9191
+
+	sts := BuildStatefulSet(inst, nil)
+	svc := BuildService(inst)
+
+	containerPort := containerPortByName(sts.Spec.Template.Spec.Containers[0].Ports, MetricsPortName)
+	require.NotNil(t, containerPort)
+	assert.Equal(t, int32(9191), containerPort.ContainerPort)
+
+	servicePort := servicePortByName(svc.Spec.Ports, MetricsPortName)
+	require.NotNil(t, servicePort)
+	assert.Equal(t, int32(9191), servicePort.Port)
+	assert.Equal(t, containerPort.Name, servicePort.TargetPort.StrVal)
+}
+
+func TestBuildStatefulSet_DisabledMetricsOmitsMetricsPort(t *testing.T) {
+	t.Parallel()
+	inst := minimalInstance()
+	inst.Spec.Observability.Metrics.Enabled = Ptr(false)
+
+	sts := BuildStatefulSet(inst, nil)
+
+	assert.Nil(t, containerPortByName(sts.Spec.Template.Spec.Containers[0].Ports, MetricsPortName))
+}
+
 func minimalInstance() *hermesv1.HermesInstance {
 	return &hermesv1.HermesInstance{
 		ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "agents"},
+		Spec: hermesv1.HermesInstanceSpec{
+			Image: hermesv1.ImageSpec{
+				Repository: hermesv1.DefaultAgentImageRepository,
+				Tag:        hermesv1.DefaultAgentImageTag,
+			},
+		},
 	}
 }
 
@@ -99,18 +219,35 @@ func TestBuildStatefulSet_HonorsResources(t *testing.T) {
 	assert.Equal(t, resource.MustParse("512Mi"), c.Resources.Limits[corev1.ResourceMemory])
 }
 
-func TestBuildStatefulSet_OverridesSecurityContexts(t *testing.T) {
+func TestBuildStatefulSet_MergesSecurityContextOverridesWithHardenedDefaults(t *testing.T) {
 	t.Parallel()
 	inst := minimalInstance()
 	inst.Spec.Security.PodSecurityContext = &corev1.PodSecurityContext{
 		RunAsUser: Ptr(int64(2000)),
 	}
 	inst.Spec.Security.ContainerSecurityContext = &corev1.SecurityContext{
-		ReadOnlyRootFilesystem: Ptr(false),
+		RunAsUser: Ptr(int64(2000)),
 	}
+
 	sts := BuildStatefulSet(inst, nil)
-	assert.Equal(t, int64(2000), *sts.Spec.Template.Spec.SecurityContext.RunAsUser)
-	assert.False(t, *sts.Spec.Template.Spec.Containers[0].SecurityContext.ReadOnlyRootFilesystem)
+	podCtx := sts.Spec.Template.Spec.SecurityContext
+	containerCtx := sts.Spec.Template.Spec.Containers[0].SecurityContext
+
+	require.NotNil(t, podCtx.RunAsNonRoot)
+	assert.True(t, *podCtx.RunAsNonRoot)
+	assert.Equal(t, int64(2000), *podCtx.RunAsUser)
+	assert.Equal(t, int64(1000), *podCtx.RunAsGroup)
+	assert.Equal(t, int64(1000), *podCtx.FSGroup)
+	require.NotNil(t, podCtx.SeccompProfile)
+	assert.Equal(t, corev1.SeccompProfileTypeRuntimeDefault, podCtx.SeccompProfile.Type)
+
+	require.NotNil(t, containerCtx.AllowPrivilegeEscalation)
+	assert.False(t, *containerCtx.AllowPrivilegeEscalation)
+	require.NotNil(t, containerCtx.ReadOnlyRootFilesystem)
+	assert.True(t, *containerCtx.ReadOnlyRootFilesystem)
+	assert.Equal(t, int64(2000), *containerCtx.RunAsUser)
+	require.NotNil(t, containerCtx.Capabilities)
+	assert.Equal(t, []corev1.Capability{"ALL"}, containerCtx.Capabilities.Drop)
 }
 
 func TestBuildStatefulSet_ProbeOverrides(t *testing.T) {
@@ -401,11 +538,47 @@ func TestBuildStatefulSet_IdempotentWithRuntimeGatewaysHoncho(t *testing.T) {
 
 func TestBuildStatefulSet_AcceptsInitContainers(t *testing.T) {
 	inst := minimalInstance()
-	initC := corev1.Container{Name: "init-restore", Image: "restic/restic:0.16.4"}
+	initC := corev1.Container{Name: "init-restore", Image: "ghcr.io/paperclipinc/hermes-agent:1.0.0"}
 	sts := BuildStatefulSet(inst, []corev1.Container{initC})
 	require.NotNil(t, sts)
 	// extraInits must come BEFORE operator-managed inits: restore writes to PVC
 	// before runtime-init starts touching it.
 	require.NotEmpty(t, sts.Spec.Template.Spec.InitContainers)
 	assert.Equal(t, "init-restore", sts.Spec.Template.Spec.InitContainers[0].Name)
+}
+
+func volumeByName(volumes []corev1.Volume, name string) *corev1.Volume {
+	for i := range volumes {
+		if volumes[i].Name == name {
+			return &volumes[i]
+		}
+	}
+	return nil
+}
+
+func volumeMountByName(mounts []corev1.VolumeMount, name string) *corev1.VolumeMount {
+	for i := range mounts {
+		if mounts[i].Name == name {
+			return &mounts[i]
+		}
+	}
+	return nil
+}
+
+func containerPortByName(ports []corev1.ContainerPort, name string) *corev1.ContainerPort {
+	for i := range ports {
+		if ports[i].Name == name {
+			return &ports[i]
+		}
+	}
+	return nil
+}
+
+func servicePortByName(ports []corev1.ServicePort, name string) *corev1.ServicePort {
+	for i := range ports {
+		if ports[i].Name == name {
+			return &ports[i]
+		}
+	}
+	return nil
 }

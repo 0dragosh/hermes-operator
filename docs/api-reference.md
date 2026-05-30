@@ -20,6 +20,13 @@
   - [spec.initContainers, spec.sidecars, spec.extraVolumes, spec.extraVolumeMounts](#specextras)
   - [spec.env, spec.envFrom, spec.skills](#specenv)
   - [spec.suspended](#specsuspended)
+  - [spec.backup](#specbackup)
+  - [spec.restoreFrom](#specrestorefrom)
+  - [spec.autoUpdate](#specautoupdate)
+  - [spec.migration](#specmigration)
+  - [spec.runtime](#specruntime)
+  - [spec.gateways](#specgateways)
+  - [spec.profileStore](#specprofilestore)
   - [status](#hermesinstance-status)
 - [HermesClusterDefaults](#hermesclusterdefaults)
   - [spec.image](#hcd-specimage)
@@ -50,8 +57,8 @@ Selects the OCI image for the hermes-agent container.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `spec.image.repository` | `string` | `ghcr.io/paperclipinc/hermes-agent` | Container image repository. |
-| `spec.image.tag` | `string` | `latest` | Image tag. |
+| `spec.image.repository` | `string` | none | Container image repository. Required unless populated by `HermesClusterDefaults`. |
+| `spec.image.tag` | `string` | none | Concrete image tag. Required for tag-based repositories; `latest` is rejected unless the repository is pinned by digest. |
 | `spec.image.pullPolicy` | `string` (enum) | `IfNotPresent` | Image pull policy. Allowed values: `Always`, `IfNotPresent`, `Never`. |
 
 ### spec.config
@@ -66,11 +73,11 @@ Supplies the body of `~/.hermes/config.yaml`. Exactly one of `raw` or `configMap
 
 ### spec.workspace
 
-Seeds initial files and directories into `~/.hermes` on first start. Nested paths are supported (e.g. `notes/finance/2026.md`); the workspace ConfigMap encodes nested paths using `__` as separator, which the runtime-init container (Plan 3) decodes back to filesystem paths.
+Seeds initial files and directories into `~/.hermes` on first start. Nested paths are supported (e.g. `notes/finance/2026.md`); the workspace ConfigMap escapes path separators into safe keys and the bootstrap init container decodes them before copying.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `spec.workspace.initialFiles` | `[]WorkspaceFile` (listType=map, listMapKey=path) | `[]` | Files to seed. Each entry has a `path` (relative to `~/.hermes`, 1-4096 chars, no leading/trailing slash) and a `content` (UTF-8 body, max 1 MiB). |
+| `spec.workspace.initialFiles` | `[]WorkspaceFile` (listType=map, listMapKey=path) | `[]` | Files to seed. Each entry has a `path` (relative to `~/.hermes`, 1-4096 chars, letters/digits/dot/hyphen/underscore/slash only, no dot segments) and a `content` (UTF-8 body, max 1 MiB). |
 | `spec.workspace.initialDirs` | `[]string` (listType=set) | `[]` | Directories to `mkdir -p` on first start. |
 | `spec.workspace.configMapRef` | `LocalObjectReference` | `nil` | User-owned ConfigMap whose entries are merged onto `initialFiles`. Operator-managed entries win on key conflicts. |
 | `spec.workspace.bootstrap.enabled` | `*bool` | `false` | When true, hermes-agent runs a one-shot bootstrap script (`hermes onboard`) on first start. Plan 3 wires the actual init-container. |
@@ -119,15 +126,16 @@ Controls per-instance ServiceAccount, Role, and RoleBinding creation.
 
 #### spec.security.networkPolicy
 
-Controls per-instance NetworkPolicy creation (default-deny baseline + selective allow).
+Controls per-instance NetworkPolicy creation (default-deny baseline + selective allow). Kubernetes NetworkPolicy has no portable FQDN peer support, so gateway enablement does not create broad all-destination HTTPS egress.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `spec.security.networkPolicy.enabled` | `*bool` | `true` | When true, the operator creates a deny-all NetworkPolicy plus selective allow rules: DNS egress, port-443 egress, and Service ingress from the same namespace. |
-| `spec.security.networkPolicy.allowDNS` | `*bool` | `true` | Emits a standard DNS egress rule (UDP+TCP port 53 to any peer). Disable only when CoreDNS is reachable via a different transport (e.g. node-local DNS via hostNetwork). |
-| `spec.security.networkPolicy.allowedIngressNamespaces` | `[]string` (listType=set) | `[]` | Additional namespaces whose pods may connect to the agent's exposed ports (beyond the instance's own namespace). |
+| `spec.security.networkPolicy.enabled` | `*bool` | `true` | When true, the operator creates a deny-all NetworkPolicy plus selective allow rules. By default this only emits DNS egress; ingress sources and non-DNS egress destinations must be configured explicitly. |
+| `spec.security.networkPolicy.allowDNS` | `*bool` | `true` | Emits a standard DNS egress rule (UDP+TCP port 53 to any peer). Kubernetes NetworkPolicy cannot portably target CoreDNS without cluster-specific selectors. Strict installs can set this false and supply DNS egress through `additionalEgress`. |
+| `spec.security.networkPolicy.allowSameNamespaceIngress` | `*bool` | `false` | Allows pods from the instance namespace to connect to the agent's exposed ports. |
+| `spec.security.networkPolicy.allowedIngressNamespaces` | `[]string` (listType=set) | `[]` | Namespaces whose pods may connect to the agent's exposed ports. |
 | `spec.security.networkPolicy.allowedIngressCIDRs` | `[]string` (listType=set) | `[]` | CIDRs that may connect to the agent's exposed ports. |
-| `spec.security.networkPolicy.allowedEgressCIDRs` | `[]string` (listType=set) | `[]` | CIDRs the agent may connect to in addition to operator-built defaults (DNS + port 443). |
+| `spec.security.networkPolicy.allowedEgressCIDRs` | `[]string` (listType=set) | `[]` | CIDRs the agent may connect to in addition to operator-built DNS egress. Configure this or `additionalEgress` for gateway upstreams until CNI-specific FQDN policies exist. |
 | `spec.security.networkPolicy.additionalEgress` | `[]networkingv1.NetworkPolicyEgressRule` | `[]` | User-supplied egress rules appended verbatim to the generated NetworkPolicy. |
 
 #### spec.security.caBundle
@@ -200,7 +208,7 @@ Controls metrics exposure, Prometheus Operator integration, and logging configur
 |---|---|---|---|
 | `spec.observability.metrics.enabled` | `*bool` | `true` | When true, the agent container exposes a `/metrics` endpoint. |
 | `spec.observability.metrics.port` | `int32` | `9090` | Port for the `/metrics` endpoint (1-65535). |
-| `spec.observability.metrics.secure` | `*bool` | `false` | When true, `/metrics` requires bearer-token auth and uses HTTPS. The ServiceMonitor scheme/scrape settings must agree (see lesson #435/#440). |
+| `spec.observability.metrics.secure` | `*bool` | `true` | When true, `/metrics` requires bearer-token auth and uses HTTPS. The ServiceMonitor scheme/scrape settings must agree (see lesson #435/#440). |
 
 #### spec.observability.serviceMonitor
 
@@ -301,7 +309,7 @@ The allowlist policy for `HermesSelfConfig` mutations (Plan 4). Declares here so
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `spec.sidecars` | `[]corev1.Container` | `[]` | User-supplied sidecar containers appended after operator-managed sidecars (e.g. ollama, web-terminal, tailscale from Plan 3). |
+| `spec.sidecars` | `[]corev1.Container` | `[]` | User-supplied sidecar containers appended after operator-managed sidecars. |
 
 #### spec.extraVolumes
 
@@ -341,6 +349,72 @@ The allowlist policy for `HermesSelfConfig` mutations (Plan 4). Declares here so
 |---|---|---|---|
 | `spec.suspended` | `bool` | `false` | When true, scales the StatefulSet to zero replicas. State (PVC, ConfigMap, etc.) is preserved. The instance `status.phase` transitions to `Suspended`. |
 
+### spec.backup
+
+Configures raw `.tar.zst` snapshots of `/home/hermes/.hermes/` to S3-compatible storage. Snapshot objects contain `meta.json` in the archive and are stored directly as S3 objects.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `spec.backup.s3.bucket` | `string` | Required when backup is enabled | S3 bucket name. |
+| `spec.backup.s3.endpoint` | `string` | Required when backup is enabled | S3-compatible endpoint such as `s3.amazonaws.com` or `http://minio:9000`. |
+| `spec.backup.s3.region` | `string` | `""` | AWS region passed to the backup and prune jobs. |
+| `spec.backup.s3.pathPrefix` | `string` | `""` | Optional key prefix prepended before `<namespace>/<instance>/`. |
+| `spec.backup.s3.credentialsSecretRef.name` | `string` | Required when backup is enabled | Same-namespace Secret with `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY`. |
+| `spec.backup.schedule` | `string` | `""` | Cron schedule for recurring backups. |
+| `spec.backup.onDelete` | `bool` | `false` | When true, a finalizer runs one final backup before deletion completes. |
+| `spec.backup.preUpdate` | `*bool` | `true` | When true, auto-update takes a pre-update snapshot. |
+| `spec.backup.historyLimit` | `*int32` | `30` | Number of successful `.tar.zst` objects kept by the prune CronJob. |
+| `spec.backup.failedHistoryLimit` | `*int32` | `3` | Number of failed `.tar.zst` objects kept under the `failed/` prefix. |
+| `spec.backup.image` | `string` | `""` | Optional override for the backup and prune job image. Defaults to the instance agent image. |
+
+Successful snapshot keys use:
+
+```text
+<pathPrefix><namespace>/<instance>/<timestamp>.tar.zst
+```
+
+Failed snapshot keys use:
+
+```text
+<pathPrefix><namespace>/<instance>/failed/<timestamp>.tar.zst
+```
+
+### spec.restoreFrom
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `spec.restoreFrom` | `string` | `""` | S3 object key of a raw `.tar.zst` snapshot to restore into an empty PVC. Once `status.restoredFrom` is latched, the field is immutable. |
+
+### spec.autoUpdate
+
+Controls opt-in OCI registry polling for newer hermes-agent images.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `spec.autoUpdate.enabled` | `bool` | `false` | Enables image polling and rollout orchestration. |
+| `spec.autoUpdate.source.registry` | `string` | `""` | OCI repository to poll. |
+| `spec.autoUpdate.source.channel` | `string` | `""` | Channel or tag selector interpreted by the auto-update controller. |
+| `spec.autoUpdate.pollInterval` | `string` | `1h` | Poll interval. |
+| `spec.autoUpdate.backupBeforeUpdate` | `*bool` | `true` | Takes a raw `.tar.zst` backup before applying an update when backup S3 is configured. |
+| `spec.autoUpdate.rollback.enabled` | `*bool` | `true` | Enables rollback after failed readiness. |
+| `spec.autoUpdate.rollback.probeFailureThreshold` | `int32` | `3` | Number of readiness failures before rollback. |
+
+### spec.migration
+
+Configures a one-shot import from OpenClaw. `spec.restoreFrom` and `spec.migration.fromOpenClaw` are mutually exclusive.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `spec.migration.fromOpenClaw.mode` | `string` (enum) | `copy` | `copy` leaves the source untouched. `move` records migration intent but does not delete the source. |
+| `spec.migration.fromOpenClaw.image` | `string` | `""` | Optional override for the migration init container image. |
+| `spec.migration.fromOpenClaw.source.openclawInstanceRef.name` | `string` | Required for in-cluster mode | Source OpenClawInstance name. |
+| `spec.migration.fromOpenClaw.source.openclawInstanceRef.namespace` | `string` | Required for in-cluster mode | Source OpenClawInstance namespace. |
+| `spec.migration.fromOpenClaw.source.backupRef.s3.bucket` | `string` | Required for S3 mode | S3 bucket containing the raw OpenClaw `.tar.zst` object. |
+| `spec.migration.fromOpenClaw.source.backupRef.s3.endpoint` | `string` | Required for S3 mode | S3-compatible endpoint. |
+| `spec.migration.fromOpenClaw.source.backupRef.s3.region` | `string` | `""` | AWS region passed to the migration init container. |
+| `spec.migration.fromOpenClaw.source.backupRef.s3.key` | `string` | Required for S3 mode | S3 object key for the raw `.tar.zst` archive. |
+| `spec.migration.fromOpenClaw.source.backupRef.s3.credentialsSecretRef.name` | `string` | Required for S3 mode | Same-namespace Secret with `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY`. |
+
 ### `spec.runtime`
 
 Controls the Python/uv runtime concerns of the agent container.
@@ -354,7 +428,7 @@ Controls the Python/uv runtime concerns of the agent container.
 | `uv.cacheVolume.persistentVolumeClaim` | PersistentVolumeClaimVolumeSource | nil | If set, overrides the emptyDir. |
 | `ffmpeg.enabled` | *bool | `true` | Toggles the FFmpeg dependency check (image always ships FFmpeg). |
 | `ripgrep.enabled` | *bool | `true` | Toggles the ripgrep dependency check. |
-| `extraAptPackages` | []string | `[]` | Adds APT packages via a root-privileged init container. **Security implication**: the init container runs as UID 0 for the duration of the apt install only. |
+| `extraAptPackages` | []string | `[]` | Unsupported compatibility field. Non-empty values are rejected because init-container package installs do not affect the main container filesystem. Build a custom agent image with the required OS packages instead. |
 | `extraPipPackages` | []string | `[]` | Adds Python packages via `uv pip install` into a persistent venv on the data PVC (`/home/hermes/.hermes/.venv-extras`). |
 
 ### `spec.gateways`
@@ -454,8 +528,8 @@ Same schema as `HermesInstance.spec.image`. Used as the cluster-wide default ima
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `spec.image.repository` | `string` | `ghcr.io/paperclipinc/hermes-agent` | Default container image repository for all instances. |
-| `spec.image.tag` | `string` | `latest` | Default image tag. |
+| `spec.image.repository` | `string` | none | Default container image repository for all instances. Required when setting tag-based image defaults. |
+| `spec.image.tag` | `string` | none | Default concrete image tag. Required for tag-based repositories; `latest` is rejected unless the repository is pinned by digest. |
 | `spec.image.pullPolicy` | `string` (enum) | `IfNotPresent` | Default pull policy. Allowed: `Always`, `IfNotPresent`, `Never`. |
 
 ### hcd spec.registry
@@ -464,7 +538,7 @@ Image-pull secret hints applied when the instance does not override.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `spec.registry.pullSecretName` | `string` | `""` | When non-empty, added to every instance's `pod.spec.imagePullSecrets` (unless the instance overrides). |
+| `spec.registry.pullSecretName` | `string` | `""` | When non-empty, copied into the pod image pull secret list for admitted instances. |
 
 ### hcd spec.storage
 
@@ -485,6 +559,7 @@ Defaults the defaultable subset of `SecuritySpec`. Note: hardened security conte
 | `spec.security.serviceAccount.annotations` | `map[string]string` | `nil` | Default annotations applied to every operator-created ServiceAccount (IRSA, GKE WI, Azure WI, etc.). |
 | `spec.security.networkPolicy.enabled` | `*bool` | `nil` (operator default `true` applies) | Default value for whether per-instance NetworkPolicies are created. |
 | `spec.security.networkPolicy.allowDNS` | `*bool` | `nil` (operator default `true` applies) | Default value for whether the DNS egress rule is emitted. |
+| `spec.security.networkPolicy.allowSameNamespaceIngress` | `*bool` | `nil` (operator default `false` applies) | Default value for whether same-namespace ingress is emitted. |
 | `spec.security.caBundle.configMapName` | `string` | `""` | Default ConfigMap name for the CA bundle. |
 | `spec.security.caBundle.secretName` | `string` | `""` | Default Secret name for the CA bundle. |
 | `spec.security.caBundle.key` | `string` | `ca.crt` | Default data-map key for the PEM bundle. |
@@ -497,7 +572,7 @@ Defaults the defaultable subset of `ObservabilitySpec`. Uses the same nested typ
 |---|---|---|---|
 | `spec.observability.metrics.enabled` | `*bool` | `true` | Default metrics enablement. |
 | `spec.observability.metrics.port` | `int32` | `9090` | Default metrics port. |
-| `spec.observability.metrics.secure` | `*bool` | `false` | Default metrics security. |
+| `spec.observability.metrics.secure` | `*bool` | `true` | Default metrics security. |
 | `spec.observability.serviceMonitor.enabled` | `*bool` | `false` | Default ServiceMonitor enablement. |
 | `spec.observability.serviceMonitor.labels` | `map[string]string` | `nil` | Default extra labels for ServiceMonitor. |
 | `spec.observability.serviceMonitor.interval` | `string` | `30s` | Default scrape interval. |
@@ -516,6 +591,7 @@ Defaults the defaultable subset of `NetworkingSpec`.
 | `spec.networking.service.type` | `string` (enum) | `""` (operator default `ClusterIP` applies) | Default Service type for all instances. Allowed: `ClusterIP`, `NodePort`, `LoadBalancer`. |
 | `spec.networking.networkPolicy.enabled` | `*bool` | `nil` | Default NetworkPolicy enablement (duplicated from `spec.security.networkPolicy` for convenience; instance-level `spec.security.networkPolicy` takes precedence). |
 | `spec.networking.networkPolicy.allowDNS` | `*bool` | `nil` | Default DNS egress rule enablement. |
+| `spec.networking.networkPolicy.allowSameNamespaceIngress` | `*bool` | `nil` | Default same-namespace ingress opt-in. |
 
 ### hcd spec.resources
 
@@ -555,7 +631,7 @@ with field manager `hermes.agent/selfconfig`.
 | `addEnvVars[].value` | string | no | Literal value. Mutually exclusive with `valueFrom`. |
 | `addEnvVars[].valueFrom.secretKeyRef` | object | no | Resolve from `Secret` key. |
 | `addEnvVars[].valueFrom.configMapKeyRef` | object | no | Resolve from `ConfigMap` key. |
-| `addWorkspaceFiles[]` | list | no | Files materialised under `~/.hermes/workspace/`. Nested paths supported via `/` → `__` ConfigMap-key encoding. |
+| `addWorkspaceFiles[]` | list | no | Files materialised under `~/.hermes/workspace/`. Nested paths are supported and escaped into ConfigMap-safe keys. |
 | `addWorkspaceFiles[].path` | string | yes | Relative path. |
 | `addWorkspaceFiles[].content` | string | no | Literal file body. |
 | `addProfileSnapshot` | object | no | Write a Honcho profile snapshot. Requires `HermesInstance.spec.profileStore.honcho.enabled=true`. |
@@ -588,7 +664,7 @@ spec:
       - "gateways.telegram.token"
 ```
 
-- `enabled: false` (or unset) → every SelfConfig is `Denied` with reason `selfconfig disabled on parent`.
+- `enabled: false` (or unset) -> every SelfConfig is `Denied` with reason `selfconfig disabled on parent`.
 - `allowedActions` is the closed set of permitted mutation categories.
 - `protectedKeys` are glob patterns matched against the dotted JSON path of `patchConfig` (gobwas/glob, `.` is the segment separator).
 

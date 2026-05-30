@@ -12,25 +12,25 @@ import (
 )
 
 var _ = Describe("Migration (build-tag: migration): openclaw -> hermes", func() {
-	const ns = "default"
-
 	It("imports a sibling OpenClawInstance via the in-cluster ref path", func() {
+		cfg := e2eConfigFromEnv()
+		ns := cfg.WorkloadNamespace
 		out, err := kubectl("get", "openclawinstance/oc-source", "-n", ns)
 		if err != nil {
-			Skip("oc-source OpenClawInstance not present; skipping (run: kubectl apply -f hack/migration-fixtures/)")
+			Skip("oc-source OpenClawInstance not present in " + ns + "; skipping (run: kubectl apply -f hack/migration-fixtures/ into the e2e workload namespace)")
 		}
 		_ = out
 
-		manifest := `
+		manifest, err := renderE2ETemplate(`
 apiVersion: hermes.agent/v1
 kind: HermesInstance
 metadata:
   name: hermes-from-oc
-  namespace: default
+  namespace: {{ .WorkloadNamespace }}
 spec:
   image:
-    repository: ghcr.io/paperclipinc/hermes-agent
-    tag: 1.0.0
+    repository: {{ .AgentImageRepository }}
+    tag: "{{ .AgentImageTag }}"
   storage:
     persistence:
       enabled: true
@@ -41,8 +41,10 @@ spec:
       source:
         openclawInstanceRef:
           name: oc-source
-          namespace: default
-`
+          namespace: {{ .WorkloadNamespace }}
+`, cfg)
+		Expect(err).NotTo(HaveOccurred(), "render migration manifest")
+
 		out, err = runStdin("kubectl", []string{"apply", "-f", "-"}, manifest)
 		Expect(err).ToNot(HaveOccurred(), "apply: %s", out)
 

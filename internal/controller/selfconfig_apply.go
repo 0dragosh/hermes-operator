@@ -11,12 +11,15 @@ You may obtain a copy of the License at
 package controller
 
 import (
+	"context"
 	"fmt"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	hermesv1 "github.com/paperclipinc/hermes-operator/api/v1"
 	"github.com/paperclipinc/hermes-operator/internal/resources"
@@ -67,7 +70,10 @@ func buildSkillsPatch(parent *hermesv1.HermesInstance, sc *hermesv1.HermesSelfCo
 func buildEnvVarsPatch(parent *hermesv1.HermesInstance, sc *hermesv1.HermesSelfConfig) *hermesv1.HermesInstance {
 	p := newPartialInstance(parent)
 	for _, ev := range sc.Spec.AddEnvVars {
-		out := corev1.EnvVar{Name: ev.Name, Value: ev.Value}
+		out := corev1.EnvVar{Name: ev.Name}
+		if ev.Value != nil {
+			out.Value = *ev.Value
+		}
 		if ev.ValueFrom != nil {
 			out.Value = ""
 			vf := &corev1.EnvVarSource{}
@@ -99,12 +105,39 @@ func formatAppliedFieldFile(path string) string {
 }
 
 // buildWorkspaceFilesPatch returns a partial workspace ConfigMap whose Data
-// holds only the keys we want to claim ownership of via SSA. Nested paths
-// are encoded with "/" -> "__" (openclaw lesson #482). The reconciler will
-// SSA-apply this against the existing workspace ConfigMap created by the
-// HermesInstance reconciler; SSA's "atomic for map values" semantics mean
-// non-listed keys remain owned by whoever wrote them.
+// holds only the keys we want to claim ownership of via SSA. Nested paths are
+// encoded into ConfigMap-safe keys by resources.EncodeWorkspacePath. The
+// reconciler SSA-applies this against the existing workspace ConfigMap created
+// by the HermesInstance reconciler; SSA's "atomic for map values" semantics
+// mean non-listed keys remain owned by whoever wrote them.
 func buildWorkspaceFilesPatch(parent *hermesv1.HermesInstance, sc *hermesv1.HermesSelfConfig) *corev1.ConfigMap {
+	cm := newWorkspaceFilesPatch(parent)
+	for _, f := range sc.Spec.AddWorkspaceFiles {
+		if f.Content != nil {
+			cm.Data[resources.EncodeWorkspacePath(f.Path)] = *f.Content
+		}
+	}
+	return cm
+}
+
+func (r *HermesSelfConfigReconciler) buildWorkspaceFilesPatch(ctx context.Context, parent *hermesv1.HermesInstance, sc *hermesv1.HermesSelfConfig) (*corev1.ConfigMap, error) {
+	cm := newWorkspaceFilesPatch(parent)
+	for _, f := range sc.Spec.AddWorkspaceFiles {
+		switch {
+		case f.Content != nil:
+			cm.Data[resources.EncodeWorkspacePath(f.Path)] = *f.Content
+		case f.ContentFrom != nil:
+			value, err := r.resolveWorkspaceFileContent(ctx, sc, f)
+			if err != nil {
+				return nil, err
+			}
+			cm.Data[resources.EncodeWorkspacePath(f.Path)] = value
+		}
+	}
+	return cm, nil
+}
+
+func newWorkspaceFilesPatch(parent *hermesv1.HermesInstance) *corev1.ConfigMap {
 	cm := &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -113,12 +146,24 @@ func buildWorkspaceFilesPatch(parent *hermesv1.HermesInstance, sc *hermesv1.Herm
 		},
 		Data: map[string]string{},
 	}
-	for _, f := range sc.Spec.AddWorkspaceFiles {
-		if f.Content != "" {
-			cm.Data[resources.EncodeWorkspacePath(f.Path)] = f.Content
-		}
-	}
 	return cm
+}
+
+func (r *HermesSelfConfigReconciler) resolveWorkspaceFileContent(ctx context.Context, sc *hermesv1.HermesSelfConfig, f hermesv1.SelfConfigWorkspaceFile) (string, error) {
+	ref := f.ContentFrom
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Name: ref.Name, Namespace: sc.Namespace}
+	if err := r.Get(ctx, key, secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", fmt.Errorf("workspace file %q contentFrom Secret %q not found", f.Path, ref.Name)
+		}
+		return "", fmt.Errorf("workspace file %q contentFrom Secret %q: %w", f.Path, ref.Name, err)
+	}
+	value, ok := secret.Data[ref.Key]
+	if !ok {
+		return "", fmt.Errorf("workspace file %q contentFrom Secret %q key %q not found", f.Path, ref.Name, ref.Key)
+	}
+	return string(value), nil
 }
 
 // buildPatchConfigPayload turns a patchConfig into a partial workspace

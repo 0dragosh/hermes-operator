@@ -57,7 +57,7 @@ func TestBuildEnvVarsPatch_LiteralAndValueFrom(t *testing.T) {
 	sc := &hermesv1.HermesSelfConfig{
 		Spec: hermesv1.HermesSelfConfigSpec{
 			AddEnvVars: []hermesv1.SelfConfigEnvVar{
-				{Name: "FINANCE_TZ", Value: "Europe/Berlin"},
+				{Name: "FINANCE_TZ", Value: Ptr("Europe/Berlin")},
 				{Name: "API_KEY", ValueFrom: &hermesv1.SelfConfigEnvVarSource{
 					SecretKeyRef: &hermesv1.SelfConfigKeySelector{Name: "finance-creds", Key: "apiKey"},
 				}},
@@ -89,15 +89,15 @@ func TestBuildWorkspaceFilesPatch_NestedPaths(t *testing.T) {
 	sc := &hermesv1.HermesSelfConfig{
 		Spec: hermesv1.HermesSelfConfigSpec{
 			AddWorkspaceFiles: []hermesv1.SelfConfigWorkspaceFile{
-				{Path: "notes/finance.md", Content: "# Finance"},
-				{Path: "flat.md", Content: "hello"},
+				{Path: "notes/finance.md", Content: Ptr("# Finance")},
+				{Path: "flat.md", Content: Ptr("hello")},
 			},
 		},
 	}
 	cm := buildWorkspaceFilesPatch(parent, sc)
 	assert.Equal(t, "my-hermes-workspace", cm.Name)
 	assert.Equal(t, "agents", cm.Namespace)
-	assert.Equal(t, "# Finance", cm.Data["notes__finance.md"])
+	assert.Equal(t, "# Finance", cm.Data["notes_sfinance.md"])
 	assert.Equal(t, "hello", cm.Data["flat.md"])
 	assert.Equal(t, "v1", cm.APIVersion)
 	assert.Equal(t, "ConfigMap", cm.Kind)
@@ -131,7 +131,7 @@ func TestMergeConfigMapPatches_CombinesKeys(t *testing.T) {
 		Spec: hermesv1.HermesSelfConfigSpec{
 			PatchConfig: &apiextensionsv1.JSON{Raw: []byte(`{"x":1}`)},
 			AddWorkspaceFiles: []hermesv1.SelfConfigWorkspaceFile{
-				{Path: "a.md", Content: "x"},
+				{Path: "a.md", Content: Ptr("x")},
 			},
 		},
 	}
@@ -146,7 +146,7 @@ func TestMergeConfigMapPatches_CombinesKeys(t *testing.T) {
 func TestMergeConfigMapPatches_NilHandling(t *testing.T) {
 	parent := parentInstance()
 	sc := &hermesv1.HermesSelfConfig{Spec: hermesv1.HermesSelfConfigSpec{
-		AddWorkspaceFiles: []hermesv1.SelfConfigWorkspaceFile{{Path: "a.md", Content: "x"}},
+		AddWorkspaceFiles: []hermesv1.SelfConfigWorkspaceFile{{Path: "a.md", Content: Ptr("x")}},
 	}}
 	right := buildWorkspaceFilesPatch(parent, sc)
 	assert.Same(t, right, mergeConfigMapPatches(nil, right))

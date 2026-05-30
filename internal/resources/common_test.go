@@ -87,3 +87,64 @@ func TestBoolValue(t *testing.T) {
 	assert.True(t, BoolValueOrDefault(nil, true))
 	assert.False(t, BoolValueOrDefault(Ptr(false), true))
 }
+
+func TestPersistenceEnabled_DefaultAndDisabled(t *testing.T) {
+	t.Parallel()
+	inst := &hermesv1.HermesInstance{}
+
+	assert.True(t, PersistenceEnabled(inst), "persistence defaults on")
+
+	inst.Spec.Storage.Persistence.Enabled = Ptr(false)
+	assert.False(t, PersistenceEnabled(inst), "explicit false disables persistence")
+}
+
+func TestMetricsEnabled_DefaultAndDisabled(t *testing.T) {
+	t.Parallel()
+	inst := &hermesv1.HermesInstance{}
+
+	assert.True(t, MetricsEnabled(inst), "metrics default on")
+
+	inst.Spec.Observability.Metrics.Enabled = Ptr(false)
+	assert.False(t, MetricsEnabled(inst), "explicit false disables metrics")
+}
+
+func TestEffectiveMetricsPort_DefaultAndCustom(t *testing.T) {
+	t.Parallel()
+	inst := &hermesv1.HermesInstance{}
+
+	assert.Equal(t, DefaultMetricsPort, EffectiveMetricsPort(inst))
+
+	inst.Spec.Observability.Metrics.Port = 9191
+	assert.Equal(t, int32(9191), EffectiveMetricsPort(inst))
+}
+
+func TestEffectiveAgentTag_AutoUpdateTargetPrecedence(t *testing.T) {
+	t.Parallel()
+	inst := &hermesv1.HermesInstance{}
+	inst.Spec.Image.Tag = "stable"
+	inst.Spec.AutoUpdate.Enabled = true
+	inst.Status.AutoUpdate.CurrentTag = "v1.0.0"
+	inst.Status.AutoUpdate.TargetTag = "v1.1.0"
+
+	assert.Equal(t, "v1.1.0", EffectiveAgentTag(inst))
+}
+
+func TestEffectiveAgentTag_AutoUpdateCurrentFallback(t *testing.T) {
+	t.Parallel()
+	inst := &hermesv1.HermesInstance{}
+	inst.Spec.Image.Tag = "stable"
+	inst.Spec.AutoUpdate.Enabled = true
+	inst.Status.AutoUpdate.CurrentTag = "v1.0.0"
+
+	assert.Equal(t, "v1.0.0", EffectiveAgentTag(inst))
+}
+
+func TestEffectiveAgentTag_NonAutoUpdateUsesSpecTag(t *testing.T) {
+	t.Parallel()
+	inst := &hermesv1.HermesInstance{}
+	inst.Spec.Image.Tag = "stable"
+	inst.Status.AutoUpdate.CurrentTag = "v1.0.0"
+	inst.Status.AutoUpdate.TargetTag = "v1.1.0"
+
+	assert.Equal(t, "stable", EffectiveAgentTag(inst))
+}

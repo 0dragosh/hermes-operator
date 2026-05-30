@@ -26,31 +26,8 @@ func BuildStatefulSet(inst *hermesv1.HermesInstance, extraInits []corev1.Contain
 	}
 	image := imageRef(inst)
 
-	// Build PodSecurityContext with override support
-	podSecurityCtx := &corev1.PodSecurityContext{
-		RunAsNonRoot: Ptr(true),
-		RunAsUser:    Ptr(int64(1000)),
-		RunAsGroup:   Ptr(int64(1000)),
-		FSGroup:      Ptr(int64(1000)),
-		SeccompProfile: &corev1.SeccompProfile{
-			Type: corev1.SeccompProfileTypeRuntimeDefault,
-		},
-	}
-	if inst.Spec.Security.PodSecurityContext != nil {
-		podSecurityCtx = inst.Spec.Security.PodSecurityContext.DeepCopy()
-	}
-
-	// Build ContainerSecurityContext with override support
-	containerSecurityCtx := &corev1.SecurityContext{
-		AllowPrivilegeEscalation: Ptr(false),
-		ReadOnlyRootFilesystem:   Ptr(true),
-		Capabilities: &corev1.Capabilities{
-			Drop: []corev1.Capability{"ALL"},
-		},
-	}
-	if inst.Spec.Security.ContainerSecurityContext != nil {
-		containerSecurityCtx = inst.Spec.Security.ContainerSecurityContext.DeepCopy()
-	}
+	podSecurityCtx := mergePodSecurityContext(inst.Spec.Security.PodSecurityContext)
+	containerSecurityCtx := mergeContainerSecurityContext(inst.Spec.Security.ContainerSecurityContext)
 
 	// Build container with override support
 	c := corev1.Container{
@@ -85,6 +62,13 @@ func BuildStatefulSet(inst *hermesv1.HermesInstance, extraInits []corev1.Contain
 			FailureThreshold:    3,
 			SuccessThreshold:    1, // explicit k8s default
 		},
+	}
+	if MetricsEnabled(inst) {
+		c.Ports = append(c.Ports, corev1.ContainerPort{
+			Name:          MetricsPortName,
+			ContainerPort: EffectiveMetricsPort(inst),
+			Protocol:      corev1.ProtocolTCP,
+		})
 	}
 
 	// Set resources from spec
@@ -158,6 +142,18 @@ func BuildStatefulSet(inst *hermesv1.HermesInstance, extraInits []corev1.Contain
 	c.Env = append(c.Env, inst.Spec.Env...)
 	c.EnvFrom = append(c.EnvFrom, inst.Spec.EnvFrom...)
 
+	dataVolume := corev1.Volume{
+		Name: "data",
+		VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: PVCName(inst),
+			},
+		},
+	}
+	if !PersistenceEnabled(inst) {
+		dataVolume.VolumeSource = corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}
+	}
+
 	// Build PodSpec with scheduling and service account
 	podSpec := corev1.PodSpec{
 		RestartPolicy:                 corev1.RestartPolicyAlways,
@@ -182,14 +178,7 @@ func BuildStatefulSet(inst *hermesv1.HermesInstance, extraInits []corev1.Contain
 					},
 				},
 			},
-			{
-				Name: "data",
-				VolumeSource: corev1.VolumeSource{
-					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-						ClaimName: PVCName(inst),
-					},
-				},
-			},
+			dataVolume,
 			{
 				Name: "tmp",
 				VolumeSource: corev1.VolumeSource{
@@ -274,14 +263,87 @@ func BuildStatefulSet(inst *hermesv1.HermesInstance, extraInits []corev1.Contain
 	return sts
 }
 
+func defaultPodSecurityContext() *corev1.PodSecurityContext {
+	return &corev1.PodSecurityContext{
+		RunAsNonRoot: Ptr(true),
+		RunAsUser:    Ptr(int64(1000)),
+		RunAsGroup:   Ptr(int64(1000)),
+		FSGroup:      Ptr(int64(1000)),
+		SeccompProfile: &corev1.SeccompProfile{
+			Type: corev1.SeccompProfileTypeRuntimeDefault,
+		},
+	}
+}
+
+func defaultContainerSecurityContext() *corev1.SecurityContext {
+	return &corev1.SecurityContext{
+		RunAsNonRoot:             Ptr(true),
+		AllowPrivilegeEscalation: Ptr(false),
+		ReadOnlyRootFilesystem:   Ptr(true),
+		Capabilities: &corev1.Capabilities{
+			Drop: []corev1.Capability{"ALL"},
+		},
+	}
+}
+
+func mergePodSecurityContext(override *corev1.PodSecurityContext) *corev1.PodSecurityContext {
+	if override == nil {
+		return defaultPodSecurityContext()
+	}
+	out := override.DeepCopy()
+	defaults := defaultPodSecurityContext()
+	if out.RunAsNonRoot == nil {
+		out.RunAsNonRoot = defaults.RunAsNonRoot
+	}
+	if out.RunAsUser == nil {
+		out.RunAsUser = defaults.RunAsUser
+	}
+	if out.RunAsGroup == nil {
+		out.RunAsGroup = defaults.RunAsGroup
+	}
+	if out.FSGroup == nil {
+		out.FSGroup = defaults.FSGroup
+	}
+	if out.SeccompProfile == nil {
+		out.SeccompProfile = defaults.SeccompProfile
+	}
+	return out
+}
+
+func mergeContainerSecurityContext(override *corev1.SecurityContext) *corev1.SecurityContext {
+	if override == nil {
+		return defaultContainerSecurityContext()
+	}
+	out := override.DeepCopy()
+	defaults := defaultContainerSecurityContext()
+	if out.RunAsNonRoot == nil {
+		out.RunAsNonRoot = defaults.RunAsNonRoot
+	}
+	if out.AllowPrivilegeEscalation == nil {
+		out.AllowPrivilegeEscalation = defaults.AllowPrivilegeEscalation
+	}
+	if out.ReadOnlyRootFilesystem == nil {
+		out.ReadOnlyRootFilesystem = defaults.ReadOnlyRootFilesystem
+	}
+	if out.Capabilities == nil {
+		out.Capabilities = defaults.Capabilities.DeepCopy()
+	} else if len(out.Capabilities.Drop) == 0 {
+		out.Capabilities.Drop = append([]corev1.Capability{}, defaults.Capabilities.Drop...)
+	}
+	return out
+}
+
 func imageRef(inst *hermesv1.HermesInstance) string {
 	repo := inst.Spec.Image.Repository
 	if repo == "" {
-		repo = "ghcr.io/paperclipinc/hermes-agent"
+		repo = hermesv1.DefaultAgentImageRepository
+	}
+	if hermesv1.ImageRepositoryUsesDigest(repo) {
+		return repo
 	}
 	tag := inst.Spec.Image.Tag
-	if tag == "" {
-		tag = "latest"
+	if inst.Spec.AutoUpdate.Enabled {
+		tag = EffectiveAgentTag(inst)
 	}
 	return fmt.Sprintf("%s:%s", repo, tag)
 }

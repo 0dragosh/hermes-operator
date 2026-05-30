@@ -1,5 +1,5 @@
 # Image URL to use all building/pushing image targets
-IMG ?= controller:latest
+IMG ?= controller:dev
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
 ENVTEST_K8S_VERSION ?= 1.33.0
 
@@ -18,8 +18,8 @@ CONTAINER_TOOL ?= docker
 
 # Setting SHELL to bash allows bash commands to be executed by recipes.
 # Options are set to exit when a recipe line exits non-zero or a piped command fails.
-SHELL = /usr/bin/env bash -o pipefail
-.SHELLFLAGS = -ec
+SHELL = bash
+.SHELLFLAGS = -o pipefail -ec
 
 .PHONY: all
 all: build
@@ -63,6 +63,15 @@ vet: ## Run go vet against code.
 test: manifests generate fmt vet envtest ## Run tests.
 	$(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN)
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+
+.PHONY: test-readonly
+test-readonly: ## Run read-only unit tests without generating files.
+	CGO_ENABLED=0 go test ./api/... ./internal/resources/... ./internal/oci/... ./internal/webhook/... -count=1
+
+.PHONY: test-controller
+test-controller: envtest ## Run controller envtest with downloaded assets.
+	KUBEBUILDER_ASSETS="$$( $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path )"; \
+	CGO_ENABLED=0 KUBEBUILDER_ASSETS="$$KUBEBUILDER_ASSETS" go test ./internal/controller/... -count=1 -ginkgo.v
 
 # Utilize Kind or modify the e2e tests to load the image locally, enabling compatibility with other vendors.
 .PHONY: test-e2e  # Run the e2e tests against a Kind k8s instance that is spun up.
@@ -123,27 +132,42 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 
 # -------- hermes-agent image (Plan 3) --------
 
-AGENT_IMAGE         ?= ghcr.io/paperclipinc/hermes-agent
-HERMES_VERSION      ?= v0.13.0
+AGENT_IMAGE           ?= ghcr.io/paperclipinc/hermes-agent
+HERMES_VERSION        ?= v2026.5.29.2
 AGENT_IMAGE_PLATFORMS ?= linux/amd64,linux/arm64
+AGENT_UV_IMAGE        ?= ghcr.io/astral-sh/uv:0.11.16-python3.11-trixie@sha256:17fcaec93ec3414d025d70826fa84f9deab066cd4d63390545d48acbd781b07f
+comma := ,
+AGENT_IMAGE_LOCAL_PLATFORM ?= $(firstword $(subst $(comma), ,$(AGENT_IMAGE_PLATFORMS)))
 
 # Build the agent image for the current platform. Local dev only.
 .PHONY: agent-image-build
 agent-image-build:
-	docker build \
+	$(CONTAINER_TOOL) build \
 		--build-arg HERMES_VERSION=$(HERMES_VERSION) \
 		-t $(AGENT_IMAGE):$(HERMES_VERSION) \
 		images/hermes-agent
 
-# Multi-arch build via buildx. Pushes only if PUSH=1.
+# Multi-arch build via buildx. Pushes all platforms only if PUSH=1.
+# Local --load builds use one platform because Docker cannot load a manifest list.
 .PHONY: agent-image-buildx
 agent-image-buildx:
-	docker buildx build \
+ifeq ($(PUSH),1)
+	$(CONTAINER_TOOL) buildx build \
 		--platform $(AGENT_IMAGE_PLATFORMS) \
 		--build-arg HERMES_VERSION=$(HERMES_VERSION) \
-		$(if $(filter 1,$(PUSH)),--push,--load) \
+		--push \
 		-t $(AGENT_IMAGE):$(HERMES_VERSION) \
 		images/hermes-agent
+else
+	@test -n "$(AGENT_IMAGE_LOCAL_PLATFORM)" || { echo "AGENT_IMAGE_LOCAL_PLATFORM must be set for local --load builds." >&2; exit 1; }
+	@case "$(AGENT_IMAGE_LOCAL_PLATFORM)" in *,*) echo "Docker cannot --load a multi-platform image. Set PUSH=1 or choose one AGENT_IMAGE_LOCAL_PLATFORM." >&2; exit 1;; esac
+	$(CONTAINER_TOOL) buildx build \
+		--platform $(AGENT_IMAGE_LOCAL_PLATFORM) \
+		--build-arg HERMES_VERSION=$(HERMES_VERSION) \
+		--load \
+		-t $(AGENT_IMAGE):$(HERMES_VERSION) \
+		images/hermes-agent
+endif
 
 # Refresh images/hermes-agent/uv.lock for the requested HERMES_VERSION.
 # Rewrites the git ref in pyproject.toml, then runs `uv lock` inside an
@@ -153,31 +177,41 @@ agent-image-buildx:
 agent-image-relock:
 	sed -i.bak -E 's|(hermes-agent @ git\+https://github.com/NousResearch/hermes-agent@)[^"]+|\1$(HERMES_VERSION)|' images/hermes-agent/pyproject.toml
 	rm -f images/hermes-agent/pyproject.toml.bak
-	docker run --rm \
+	$(CONTAINER_TOOL) run --rm \
 		-v $(PWD)/images/hermes-agent:/work \
 		-w /work \
-		ghcr.io/astral-sh/uv:0.5.0 \
-		sh -c "uv lock"
+		$(AGENT_UV_IMAGE) \
+		uv lock
 	@echo "Updated images/hermes-agent/pyproject.toml and uv.lock for hermes-agent@$(HERMES_VERSION)"
 
-# Smoke-test a locally built image: --help should exit 0.
+# Smoke-test a locally built image and required runtime tools.
 .PHONY: agent-image-smoke
 agent-image-smoke:
-	docker run --rm $(AGENT_IMAGE):$(HERMES_VERSION) hermes-agent --help >/dev/null
+	$(CONTAINER_TOOL) run --rm --entrypoint /bin/sh $(AGENT_IMAGE):$(HERMES_VERSION) -c 'hermes-agent --help >/dev/null'
+	$(CONTAINER_TOOL) run --rm --entrypoint /bin/sh $(AGENT_IMAGE):$(HERMES_VERSION) -c 'aws --version'
+	$(CONTAINER_TOOL) run --rm --entrypoint /bin/sh $(AGENT_IMAGE):$(HERMES_VERSION) -c 'uv --version'
+	$(CONTAINER_TOOL) run --rm --entrypoint /bin/sh $(AGENT_IMAGE):$(HERMES_VERSION) -c 'test -f /opt/venv-template/pyproject.toml && test -f /opt/venv-template/uv.lock'
+	$(CONTAINER_TOOL) run --rm --entrypoint /bin/sh $(AGENT_IMAGE):$(HERMES_VERSION) -c 'zstd --version'
+	$(CONTAINER_TOOL) run --rm --entrypoint /bin/sh $(AGENT_IMAGE):$(HERMES_VERSION) -c 'tar --version'
+	$(CONTAINER_TOOL) run --rm --entrypoint /bin/sh $(AGENT_IMAGE):$(HERMES_VERSION) -c 'mktemp --version || mktemp -t hermes.XXXXXX'
 	@echo "agent-image-smoke OK for $(AGENT_IMAGE):$(HERMES_VERSION)"
 
 .PHONY: build-installer
 build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
 	mkdir -p dist
-	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
+	cd config/manager && $(KUSTOMIZE) edit set image ghcr.io/paperclipinc/hermes-operator=${IMG}
 	$(KUSTOMIZE) build config/default > dist/install.yaml
 
 .PHONY: installer
 installer: manifests generate kustomize ## Emit dist/install.yaml for plain kubectl apply.
 	mkdir -p dist
-	cd config/manager && $(KUSTOMIZE) edit set image controller=ghcr.io/paperclipinc/hermes-operator:$${VERSION:-latest}
+	cd config/manager && $(KUSTOMIZE) edit set image ghcr.io/paperclipinc/hermes-operator=ghcr.io/paperclipinc/hermes-operator:$${VERSION:-v$(VERSION)}
 	$(KUSTOMIZE) build config/default > dist/install.yaml
 	@echo "Wrote dist/install.yaml ($$(wc -l < dist/install.yaml) lines)"
+
+.PHONY: check-distribution-parity
+check-distribution-parity: ## Verify Helm and kustomize render required distribution resources.
+	bash hack/check-distribution-parity.sh
 
 ##@ Deployment
 
@@ -195,7 +229,7 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 
 .PHONY: deploy
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
-	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
+	cd config/manager && $(KUSTOMIZE) edit set image ghcr.io/paperclipinc/hermes-operator=${IMG}
 	$(KUSTOMIZE) build config/default | $(KUBECTL) apply -f -
 
 .PHONY: undeploy
@@ -215,12 +249,14 @@ KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
+YQ ?= $(LOCALBIN)/yq
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.4.2
 CONTROLLER_TOOLS_VERSION ?= v0.21.0
 ENVTEST_VERSION ?= release-0.24
 GOLANGCI_LINT_VERSION ?= v2.12.2
+YQ_VERSION ?= v4.45.1
 
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
@@ -241,6 +277,11 @@ $(ENVTEST): $(LOCALBIN)
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
+
+.PHONY: yq
+yq: $(YQ) ## Download mikefarah/yq locally if necessary.
+$(YQ): $(LOCALBIN)
+	$(call go-install-tool,$(YQ),github.com/mikefarah/yq/v4,$(YQ_VERSION))
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary
@@ -359,6 +400,8 @@ sync-bundle-rbac-check: ## Verify the bundle CSV RBAC is in sync (CI use).
 
 BUNDLE_IMG ?= ghcr.io/paperclipinc/hermes-operator-bundle:$(shell git describe --tags --always)
 CATALOG_IMG ?= ghcr.io/paperclipinc/hermes-operator-catalog:$(shell git describe --tags --always)
+VERSION ?= $(shell sed -n 's/^version:[[:space:]]*//p' charts/hermes-operator/Chart.yaml | head -1)
+BUNDLE_OPERATOR_IMG ?= $(if $(filter controller:dev,$(IMG)),ghcr.io/paperclipinc/hermes-operator:v$(VERSION),$(IMG))
 
 OPERATOR_SDK ?= $(LOCALBIN)/operator-sdk
 OPERATOR_SDK_VERSION ?= v1.38.0
@@ -387,8 +430,12 @@ $(OPM): $(LOCALBIN)
 	  chmod +x "$(OPM)"; \
 	fi
 
+.PHONY: update-bundle-metadata
+update-bundle-metadata: yq ## Update CSV version, image and webhook metadata.
+	VERSION=$(VERSION) IMG=$(BUNDLE_OPERATOR_IMG) YQ=$(YQ) bash hack/update-bundle-metadata.sh
+
 .PHONY: bundle
-bundle: manifests sync-bundle-crds sync-bundle-rbac ## Refresh bundle manifests from current source.
+bundle: manifests sync-bundle-crds sync-bundle-rbac update-bundle-metadata ## Refresh bundle manifests from current source.
 
 .PHONY: bundle-validate
 bundle-validate: operator-sdk ## Validate the OLM bundle.

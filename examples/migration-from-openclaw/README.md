@@ -1,4 +1,4 @@
-# Migrating from OpenClaw → Hermes
+# Migrating from OpenClaw to Hermes
 
 A one-shot, declarative migration path from openclaw-operator. The hermes-
 agent image ships with an importer (`hermes-agent migrate from-openclaw`)
@@ -47,8 +47,8 @@ kubectl create namespace agents
 
 kubectl create secret generic oc-s3-creds \
   -n agents \
-  --from-literal=accessKey=REPLACE \
-  --from-literal=secretKey=REPLACE
+  --from-literal=S3_ACCESS_KEY_ID=REPLACE \
+  --from-literal=S3_SECRET_ACCESS_KEY=REPLACE
 
 kubectl apply -n agents -f from-backup.yaml
 kubectl logs -f -n agents migrated-from-backup-0 \

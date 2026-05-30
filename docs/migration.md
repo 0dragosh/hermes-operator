@@ -1,4 +1,4 @@
-# OpenClaw → Hermes Migration
+# OpenClaw to Hermes Migration
 
 The operator supports a one-shot migration from a sibling OpenClawInstance (or its S3 backup) into a new HermesInstance. The migration is driven by an init container that runs `hermes-agent migrate from-openclaw` against the source.
 
@@ -43,7 +43,7 @@ spec:
               name: oc-s3-creds
 ```
 
-The init container downloads + extracts the snapshot to an `emptyDir` mounted at `/mnt/openclaw`, then runs the importer.
+The init container downloads the raw `.tar.zst` object, extracts it to an `emptyDir` mounted at `/mnt/openclaw`, then runs the importer. `key` is the S3 object key for that archive, not a snapshot ID, tag, or repository path.
 
 The Secret must contain `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY`.
 

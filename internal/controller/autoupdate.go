@@ -8,7 +8,6 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -150,8 +149,6 @@ func currentRunningTag(inst *hermesv1.HermesInstance) string {
 }
 
 func (a *AutoUpdateReconciler) startRollout(ctx context.Context, inst *hermesv1.HermesInstance, targetTag string) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
 	needsBackup := inst.Spec.AutoUpdate.BackupBeforeUpdate == nil || *inst.Spec.AutoUpdate.BackupBeforeUpdate
 	if needsBackup && inst.Spec.Backup.S3 != nil && a.Backup != nil {
 		_, done, err := a.Backup.RunOneShot(ctx, inst)
@@ -163,41 +160,6 @@ func (a *AutoUpdateReconciler) startRollout(ctx context.Context, inst *hermesv1.
 		if !done {
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
-	}
-
-	sts := &appsv1.StatefulSet{}
-	if err := a.Get(ctx, types.NamespacedName{Name: resources.StatefulSetName(inst), Namespace: inst.Namespace}, sts); err != nil {
-		if apierrors.IsNotFound(err) {
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-		}
-		return ctrl.Result{}, err
-	}
-
-	repo := inst.Spec.Image.Repository
-	if repo == "" {
-		repo = "ghcr.io/paperclipinc/hermes-agent"
-	}
-	desiredImage := fmt.Sprintf("%s:%s", repo, targetTag)
-	if len(sts.Spec.Template.Spec.Containers) == 0 {
-		return ctrl.Result{}, errors.New("StatefulSet has no containers")
-	}
-	if sts.Spec.Template.Spec.Containers[0].Image == desiredImage {
-		logger.Info("STS already at target image; skipping patch", "target", targetTag)
-	} else {
-		original := sts.DeepCopy()
-		sts.Spec.Template.Spec.Containers[0].Image = desiredImage
-		if err := a.Patch(ctx, sts, client.MergeFrom(original)); err != nil {
-			return ctrl.Result{}, fmt.Errorf("patch STS image: %w", err)
-		}
-	}
-
-	origCR := inst.DeepCopy()
-	if inst.Annotations == nil {
-		inst.Annotations = map[string]string{}
-	}
-	inst.Annotations[hermesv1.AnnotationAutoUpdateTarget] = targetTag
-	if err := a.Patch(ctx, inst, client.MergeFrom(origCR)); err != nil {
-		return ctrl.Result{}, fmt.Errorf("patch CR annotation: %w", err)
 	}
 
 	deadline := metav1.NewTime(a.now().Add(rolloutWindow))
@@ -213,6 +175,9 @@ func (a *AutoUpdateReconciler) startRollout(ctx context.Context, inst *hermesv1.
 	})
 	if err := a.Status().Update(ctx, inst); err != nil {
 		return ctrl.Result{}, err
+	}
+	if err := a.setTargetAnnotation(ctx, inst, targetTag); err != nil {
+		return ctrl.Result{}, fmt.Errorf("patch CR annotation: %w", err)
 	}
 	a.Recorder.Eventf(inst, corev1.EventTypeNormal, "AutoUpdateStarted",
 		"rolling out tag %s (deadline %s)", targetTag, deadline.Format(time.RFC3339))
@@ -276,12 +241,8 @@ func (a *AutoUpdateReconciler) confirmRollout(ctx context.Context, inst *hermesv
 		return ctrl.Result{}, err
 	}
 
-	if inst.Annotations[hermesv1.AnnotationAutoUpdateTarget] != "" {
-		original := inst.DeepCopy()
-		delete(inst.Annotations, hermesv1.AnnotationAutoUpdateTarget)
-		if err := a.Patch(ctx, inst, client.MergeFrom(original)); err != nil {
-			return ctrl.Result{}, err
-		}
+	if err := a.clearTargetAnnotation(ctx, inst); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	a.Recorder.Eventf(inst, corev1.EventTypeNormal, "AutoUpdateConfirmed",
@@ -293,22 +254,6 @@ func (a *AutoUpdateReconciler) rollback(ctx context.Context, inst *hermesv1.Herm
 	prev := inst.Status.AutoUpdate.LastSuccessTag
 	if prev == "" {
 		prev = inst.Spec.Image.Tag
-	}
-	repo := inst.Spec.Image.Repository
-	if repo == "" {
-		repo = "ghcr.io/paperclipinc/hermes-agent"
-	}
-	sts := &appsv1.StatefulSet{}
-	if err := a.Get(ctx, types.NamespacedName{Name: resources.StatefulSetName(inst), Namespace: inst.Namespace}, sts); err != nil {
-		return ctrl.Result{}, err
-	}
-	original := sts.DeepCopy()
-	if len(sts.Spec.Template.Spec.Containers) == 0 {
-		return ctrl.Result{}, errors.New("STS has no containers")
-	}
-	sts.Spec.Template.Spec.Containers[0].Image = fmt.Sprintf("%s:%s", repo, prev)
-	if err := a.Patch(ctx, sts, client.MergeFrom(original)); err != nil {
-		return ctrl.Result{}, fmt.Errorf("patch STS rollback: %w", err)
 	}
 
 	inst.Status.AutoUpdate.LastFailedTag = failedTag
@@ -333,17 +278,42 @@ func (a *AutoUpdateReconciler) rollback(ctx context.Context, inst *hermesv1.Herm
 		return ctrl.Result{}, err
 	}
 
-	if inst.Annotations[hermesv1.AnnotationAutoUpdateTarget] != "" {
-		origCR := inst.DeepCopy()
-		delete(inst.Annotations, hermesv1.AnnotationAutoUpdateTarget)
-		if err := a.Patch(ctx, inst, client.MergeFrom(origCR)); err != nil {
-			return ctrl.Result{}, err
-		}
+	if err := a.clearTargetAnnotation(ctx, inst); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	a.Recorder.Eventf(inst, corev1.EventTypeWarning, "AutoUpdateRolledBack",
 		"rolled back from %s to %s: %s", failedTag, prev, reason)
 	return ctrl.Result{}, nil
+}
+
+func (a *AutoUpdateReconciler) setTargetAnnotation(ctx context.Context, inst *hermesv1.HermesInstance, targetTag string) error {
+	latest := &hermesv1.HermesInstance{}
+	if err := a.Get(ctx, client.ObjectKeyFromObject(inst), latest); err != nil {
+		return err
+	}
+	if latest.Annotations[hermesv1.AnnotationAutoUpdateTarget] == targetTag {
+		return nil
+	}
+	original := latest.DeepCopy()
+	if latest.Annotations == nil {
+		latest.Annotations = map[string]string{}
+	}
+	latest.Annotations[hermesv1.AnnotationAutoUpdateTarget] = targetTag
+	return a.Patch(ctx, latest, client.MergeFrom(original))
+}
+
+func (a *AutoUpdateReconciler) clearTargetAnnotation(ctx context.Context, inst *hermesv1.HermesInstance) error {
+	latest := &hermesv1.HermesInstance{}
+	if err := a.Get(ctx, client.ObjectKeyFromObject(inst), latest); err != nil {
+		return err
+	}
+	if latest.Annotations[hermesv1.AnnotationAutoUpdateTarget] == "" {
+		return nil
+	}
+	original := latest.DeepCopy()
+	delete(latest.Annotations, hermesv1.AnnotationAutoUpdateTarget)
+	return a.Patch(ctx, latest, client.MergeFrom(original))
 }
 
 // countProbeFailures counts Unhealthy / FailedMount events on the instance's pod within the rollout window.

@@ -19,7 +19,7 @@ limitations under the License.
 // NOTE: The full rollout-confirmation state machine requires real STS ReadyReplicas
 // to advance (envtest has no kubelet), so driveRollout/confirmRollout paths are
 // covered by unit tests in autoupdate.go rather than here. These envtest specs
-// cover the observable side-effects from the poll+startRollout phase.
+// cover the observable side-effects from the poll+status-target phase.
 package controller
 
 import (
@@ -86,6 +86,7 @@ var _ = Describe("AutoUpdate sub-controller", func() {
 		Eventually(func() error {
 			return k8sClient.Get(ctx, types.NamespacedName{Name: auName, Namespace: namespace}, inst)
 		}, timeout, interval).Should(Satisfy(apierrors.IsNotFound))
+		cleanupHermesInstanceOwnedResources(ctx, auName, namespace)
 	})
 
 	Context("Idle when not enabled", func() {
@@ -132,17 +133,17 @@ var _ = Describe("AutoUpdate sub-controller", func() {
 				return k8sClient.Get(ctx, types.NamespacedName{Name: auName, Namespace: namespace}, sts)
 			}, timeout, interval).Should(Succeed())
 
-			// The controller should start a rollout because 1.1.0 > 1.0.0
-			// Observable side-effects: targetTag is set OR STS image is patched to 1.1.0
+			// The controller should start a rollout because 1.1.0 > 1.0.0.
 			Eventually(func() bool {
 				fresh := &hermesv1.HermesInstance{}
 				if err := k8sClient.Get(ctx, types.NamespacedName{Name: auName, Namespace: namespace}, fresh); err != nil {
 					return false
 				}
-				if fresh.Status.AutoUpdate.TargetTag == "1.1.0" {
-					return true
-				}
-				// Also accept if STS image was already patched
+				return fresh.Status.AutoUpdate.TargetTag == "1.1.0"
+			}, timeout, interval).Should(BeTrue(),
+				"controller should set targetTag to 1.1.0 when enabled and registry has newer tag")
+
+			Eventually(func() bool {
 				if err := k8sClient.Get(ctx, types.NamespacedName{Name: auName, Namespace: namespace}, sts); err != nil {
 					return false
 				}
@@ -151,7 +152,7 @@ var _ = Describe("AutoUpdate sub-controller", func() {
 				}
 				return false
 			}, timeout, interval).Should(BeTrue(),
-				"controller should start rollout to 1.1.0 when enabled and registry has newer tag")
+				"main reconciler should render the StatefulSet image from targetTag")
 		})
 	})
 

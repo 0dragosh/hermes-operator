@@ -80,6 +80,7 @@ var _ = Describe("Restore sub-controller", func() {
 		Eventually(func() error {
 			return k8sClient.Get(ctx, types.NamespacedName{Name: rName, Namespace: namespace}, inst)
 		}, timeout, interval).Should(Satisfy(apierrors.IsNotFound))
+		cleanupHermesInstanceOwnedResources(ctx, rName, namespace)
 	})
 
 	Context("init-restore injection", func() {
@@ -103,6 +104,20 @@ var _ = Describe("Restore sub-controller", func() {
 				}
 				return false
 			}, timeout, interval).Should(BeTrue(), "STS should have init-restore init container")
+		})
+
+		It("marks ConditionRestoreApplied=False while waiting for the StatefulSet pod", func() {
+			inst := newRestoreInstance("my-backup-bucket/snapshots/2026-01-15T00-00-00Z.tar.zst")
+			Expect(k8sClient.Create(ctx, inst)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				fresh := &hermesv1.HermesInstance{}
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rName, Namespace: namespace}, fresh)).To(Succeed())
+				cond := meta.FindStatusCondition(fresh.Status.Conditions, hermesv1.ConditionRestoreApplied)
+				g.Expect(cond).NotTo(BeNil())
+				g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+				g.Expect(cond.Reason).To(Equal("WaitingForPod"))
+			}, timeout, interval).Should(Succeed())
 		})
 
 		It("removes init-restore once status.restoredFrom matches spec.restoreFrom", func() {
@@ -139,11 +154,14 @@ var _ = Describe("Restore sub-controller", func() {
 			inst := newRestoreInstance(snapshotKey)
 			Expect(k8sClient.Create(ctx, inst)).To(Succeed())
 
+			sts := &appsv1.StatefulSet{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{Name: rName, Namespace: namespace}, sts)
+			}, timeout, interval).Should(Succeed())
+
 			// Latch the restore in status
 			fresh := &hermesv1.HermesInstance{}
-			Eventually(func() error {
-				return k8sClient.Get(ctx, types.NamespacedName{Name: rName, Namespace: namespace}, fresh)
-			}, timeout, interval).Should(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rName, Namespace: namespace}, fresh)).To(Succeed())
 			fresh.Status.RestoredFrom = snapshotKey
 			Expect(k8sClient.Status().Update(ctx, fresh)).To(Succeed())
 

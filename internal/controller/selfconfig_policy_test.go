@@ -21,8 +21,8 @@ func TestDetermineActions(t *testing.T) {
 	t.Run("multiple actions", func(t *testing.T) {
 		sc := &hermesv1.HermesSelfConfig{Spec: hermesv1.HermesSelfConfigSpec{
 			AddSkills:         []hermesv1.SelfConfigSkill{{Source: "x"}},
-			AddEnvVars:        []hermesv1.SelfConfigEnvVar{{Name: "X", Value: "y"}},
-			AddWorkspaceFiles: []hermesv1.SelfConfigWorkspaceFile{{Path: "a.md", Content: "x"}},
+			AddEnvVars:        []hermesv1.SelfConfigEnvVar{{Name: "X", Value: Ptr("y")}},
+			AddWorkspaceFiles: []hermesv1.SelfConfigWorkspaceFile{{Path: "a.md", Content: Ptr("x")}},
 		}}
 		got := DetermineActions(sc)
 		assert.ElementsMatch(t,

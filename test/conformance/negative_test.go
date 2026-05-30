@@ -34,7 +34,7 @@ metadata:
 spec:
   image:
     repository: ghcr.io/paperclipinc/hermes-agent
-    tag: latest
+    tag: v2026.5.29.2
   storage:
     persistence:
       enabled: true
@@ -65,7 +65,7 @@ metadata:
 spec:
   image:
     repository: ""
-    tag: latest
+    tag: v2026.5.29.2
   storage:
     persistence:
       enabled: true
@@ -84,7 +84,7 @@ metadata:
 spec:
   image:
     repository: ghcr.io/paperclipinc/hermes-agent
-    tag: latest
+    tag: v2026.5.29.2
   storage:
     persistence:
       enabled: true
@@ -103,7 +103,7 @@ metadata:
 spec:
   image:
     repository: ghcr.io/paperclipinc/hermes-agent
-    tag: latest
+    tag: v2026.5.29.2
   storage:
     persistence:
       enabled: true
@@ -126,7 +126,7 @@ metadata:
 spec:
   image:
     repository: ghcr.io/paperclipinc/hermes-agent
-    tag: latest
+    tag: v2026.5.29.2
   storage:
     persistence:
       enabled: true
@@ -149,7 +149,7 @@ metadata:
 spec:
   image:
     repository: ghcr.io/paperclipinc/hermes-agent
-    tag: latest
+    tag: v2026.5.29.2
   storage:
     persistence:
       enabled: true
@@ -174,7 +174,7 @@ metadata:
 spec:
   image:
     repository: ghcr.io/paperclipinc/hermes-agent
-    tag: latest
+    tag: v2026.5.29.2
   storage:
     persistence:
       enabled: true
@@ -198,7 +198,7 @@ metadata:
 spec:
   image:
     repository: ghcr.io/paperclipinc/hermes-agent
-    tag: latest
+    tag: v2026.5.29.2
   storage:
     persistence:
       enabled: true
@@ -222,7 +222,7 @@ metadata:
 spec:
   image:
     repository: ghcr.io/paperclipinc/hermes-agent
-    tag: latest
+    tag: v2026.5.29.2
   storage:
     persistence:
       enabled: true
@@ -249,7 +249,7 @@ metadata:
 spec:
   image:
     repository: ghcr.io/paperclipinc/hermes-agent
-    tag: latest
+    tag: v2026.5.29.2
   storage:
     persistence:
       enabled: true
@@ -282,7 +282,7 @@ metadata:
 spec:
   image:
     repository: ghcr.io/paperclipinc/hermes-agent
-    tag: latest
+    tag: v2026.5.29.2
   storage:
     persistence:
       enabled: true
@@ -293,6 +293,145 @@ spec:
       source: {}
 `,
 		wantErrSubstring: "source",
+	},
+
+	// -- migration S3 rejects unsafe object keys ------------------------------
+	{
+		name: "deny: migration S3 key path traversal",
+		yaml: `apiVersion: hermes.agent/v1
+kind: HermesInstance
+metadata:
+  name: neg-migration-s3-key-traversal
+spec:
+  image:
+    repository: ghcr.io/paperclipinc/hermes-agent
+    tag: v2026.5.29.2
+  storage:
+    persistence:
+      enabled: true
+      size: 1Gi
+  migration:
+    fromOpenClaw:
+      mode: copy
+      source:
+        backupRef:
+          s3:
+            bucket: my-bucket
+            endpoint: s3.example.com
+            key: ../backup.tar.zst
+            credentialsSecretRef:
+              name: s3-creds
+`,
+		wantErrSubstring: "key",
+	},
+
+	// -- migration S3 rejects unsafe endpoints --------------------------------
+	{
+		name: "deny: migration S3 endpoint shell metacharacter",
+		yaml: `apiVersion: hermes.agent/v1
+kind: HermesInstance
+metadata:
+  name: neg-migration-s3-endpoint-shell
+spec:
+  image:
+    repository: ghcr.io/paperclipinc/hermes-agent
+    tag: v2026.5.29.2
+  storage:
+    persistence:
+      enabled: true
+      size: 1Gi
+  migration:
+    fromOpenClaw:
+      mode: copy
+      source:
+        backupRef:
+          s3:
+            bucket: my-bucket
+            endpoint: s3.example.com;rm
+            key: backup.tar.zst
+            credentialsSecretRef:
+              name: s3-creds
+`,
+		wantErrSubstring: "endpoint",
+	},
+
+	// -- runtime.extraAptPackages is unsupported -----------------------------
+	{
+		name: "deny: runtime extraAptPackages",
+		yaml: hermesInstanceYAML("neg-extra-apt", `runtime:
+  extraAptPackages:
+    - curl`),
+		wantErrSubstring: "custom agent image",
+	},
+
+	// -- unsafe workload passthrough ------------------------------------------
+	{
+		name: "deny: sidecar privileged security context",
+		yaml: hermesInstanceYAML("neg-sidecar-privileged", `sidecars:
+  - name: debug
+    image: busybox:1.36.1
+    securityContext:
+      privileged: true`),
+		wantErrSubstring: "privileged",
+	},
+	{
+		name: "deny: extraVolumes hostPath",
+		yaml: hermesInstanceYAML("neg-hostpath", `extraVolumes:
+  - name: host
+    hostPath:
+      path: /var/lib/kubelet`),
+		wantErrSubstring: "hostPath",
+	},
+	{
+		name: "deny: extraVolumeMounts docker socket",
+		yaml: hermesInstanceYAML("neg-docker-sock", `extraVolumeMounts:
+  - name: docker
+    mountPath: /var/run/docker.sock`),
+		wantErrSubstring: "docker.sock",
+	},
+
+	// -- unsafe network exposure ---------------------------------------------
+	{
+		name: "deny: NodePort service",
+		yaml: hermesInstanceYAML("neg-nodeport", `networking:
+  service:
+    type: NodePort`),
+		wantErrSubstring: "NodePort",
+	},
+	{
+		name: "deny: LoadBalancer service",
+		yaml: hermesInstanceYAML("neg-loadbalancer", `networking:
+  service:
+    type: LoadBalancer`),
+		wantErrSubstring: "LoadBalancer",
+	},
+	{
+		name: "deny: ingress enabled without TLS",
+		yaml: hermesInstanceYAML("neg-ingress-no-tls", `networking:
+  ingress:
+    enabled: true
+    host: hermes.example.com`),
+		wantErrSubstring: "TLS",
+	},
+	{
+		name: "deny: ingress disables TLS redirect",
+		yaml: hermesInstanceYAML("neg-ingress-no-redirect", `networking:
+  ingress:
+    enabled: true
+    host: hermes.example.com
+    tls:
+      - secretName: hermes-tls
+    annotations:
+      nginx.ingress.kubernetes.io/ssl-redirect: "false"`),
+		wantErrSubstring: "ssl-redirect",
+	},
+	{
+		name: "deny: metrics enabled with secure false",
+		yaml: hermesInstanceYAML("neg-metrics-insecure", `observability:
+  metrics:
+    enabled: true
+    secure: false`),
+		wantErrSubstring: "secure",
 	},
 
 	// ── immutable: storageClassName changed ──────────────────────────────────
@@ -306,7 +445,7 @@ metadata:
 spec:
   image:
     repository: ghcr.io/paperclipinc/hermes-agent
-    tag: latest
+    tag: v2026.5.29.2
   storage:
     persistence:
       enabled: true
@@ -320,7 +459,7 @@ metadata:
 spec:
   image:
     repository: ghcr.io/paperclipinc/hermes-agent
-    tag: latest
+    tag: v2026.5.29.2
   storage:
     persistence:
       enabled: true
@@ -340,7 +479,7 @@ metadata:
 spec:
   image:
     repository: ghcr.io/paperclipinc/hermes-agent
-    tag: latest
+    tag: v2026.5.29.2
   storage:
     persistence:
       enabled: true
@@ -362,7 +501,7 @@ metadata:
 spec:
   image:
     repository: ghcr.io/paperclipinc/hermes-agent
-    tag: latest
+    tag: v2026.5.29.2
   storage:
     persistence:
       enabled: true
@@ -384,7 +523,7 @@ metadata:
 spec:
   image:
     repository: ghcr.io/paperclipinc/hermes-agent
-    tag: latest
+    tag: v2026.5.29.2
   storage:
     persistence:
       enabled: true
@@ -406,7 +545,7 @@ metadata:
 spec:
   image:
     repository: ghcr.io/paperclipinc/hermes-agent
-    tag: latest
+    tag: v2026.5.29.2
   storage:
     persistence:
       enabled: true
@@ -428,7 +567,7 @@ metadata:
 spec:
   image:
     repository: ghcr.io/paperclipinc/hermes-agent
-    tag: latest
+    tag: v2026.5.29.2
   storage:
     persistence:
       enabled: true
@@ -452,7 +591,7 @@ metadata:
 spec:
   image:
     repository: ghcr.io/paperclipinc/hermes-agent
-    tag: latest
+    tag: v2026.5.29.2
   storage:
     persistence:
       enabled: true
@@ -483,6 +622,49 @@ spec:
 		wantErrSubstring: "instanceRef",
 	},
 
+	// HermesSelfConfig: addEnvVars value and valueFrom are mutually exclusive.
+	{
+		name:     "deny: HermesSelfConfig addEnvVars value and valueFrom",
+		isUpdate: false,
+		baseYAML: hermesInstanceYAML("neg-parent-env-xor", ""),
+		yaml: fmt.Sprintf(`apiVersion: hermes.agent/v1
+kind: HermesSelfConfig
+metadata:
+  name: neg-selfconfig-env-xor
+spec:
+  instanceRef: %s
+  addEnvVars:
+    - name: TOKEN
+      value: literal
+      valueFrom:
+        secretKeyRef:
+          name: tokens
+          key: token
+`, "neg-parent-env-xor"),
+		wantErrSubstring: "valueFrom",
+	},
+
+	// HermesSelfConfig: addWorkspaceFiles content and contentFrom are exclusive.
+	{
+		name:     "deny: HermesSelfConfig addWorkspaceFiles content and contentFrom",
+		isUpdate: false,
+		baseYAML: hermesInstanceYAML("neg-parent-workspace-xor", ""),
+		yaml: fmt.Sprintf(`apiVersion: hermes.agent/v1
+kind: HermesSelfConfig
+metadata:
+  name: neg-selfconfig-workspace-xor
+spec:
+  instanceRef: %s
+  addWorkspaceFiles:
+    - path: notes/secure.md
+      content: literal
+      contentFrom:
+        name: workspace
+        key: secure.md
+`, "neg-parent-workspace-xor"),
+		wantErrSubstring: "contentFrom",
+	},
+
 	// ── HermesSelfConfig: addProfileSnapshot without honcho enabled ───────────
 	// This case requires a parent HermesInstance without profileStore.honcho enabled.
 	{
@@ -500,6 +682,52 @@ spec:
     data: '{"preferences":{}}'
 `, "neg-parent-no-honcho"),
 		wantErrSubstring: "profileStore.honcho",
+	},
+
+	// HermesSelfConfig: addProfileSnapshot profileID must be path-safe.
+	{
+		name:     "deny: HermesSelfConfig addProfileSnapshot profileID shell metacharacters",
+		isUpdate: false,
+		baseYAML: hermesInstanceYAML("neg-parent-profile-shell", `profileStore:
+  honcho:
+    enabled: true
+    apiKeySecretRef:
+      name: honcho-api
+      key: api-key`),
+		yaml: fmt.Sprintf(`apiVersion: hermes.agent/v1
+kind: HermesSelfConfig
+metadata:
+  name: neg-selfconfig-profile-shell
+spec:
+  instanceRef: %s
+  addProfileSnapshot:
+    profileID: "prod; touch /tmp/pwned"
+    data: '{"preferences":{}}'
+`, "neg-parent-profile-shell"),
+		wantErrSubstring: "profileID",
+	},
+
+	// HermesSelfConfig: addProfileSnapshot profileID cannot traverse paths.
+	{
+		name:     "deny: HermesSelfConfig addProfileSnapshot profileID path traversal",
+		isUpdate: false,
+		baseYAML: hermesInstanceYAML("neg-parent-profile-path", `profileStore:
+  honcho:
+    enabled: true
+    apiKeySecretRef:
+      name: honcho-api
+      key: api-key`),
+		yaml: fmt.Sprintf(`apiVersion: hermes.agent/v1
+kind: HermesSelfConfig
+metadata:
+  name: neg-selfconfig-profile-path
+spec:
+  instanceRef: %s
+  addProfileSnapshot:
+    profileID: "../prod"
+    data: '{"preferences":{}}'
+`, "neg-parent-profile-path"),
+		wantErrSubstring: "profileID",
 	},
 }
 

@@ -32,25 +32,24 @@ is computed at the end of every reconcile:
 
 | Status | Reason | When |
 |---|---|---|
-| True | `AllSubsystemsReady` | Every other condition that is set on the object reports `True`. Includes `StorageReady`, `ConfigReady`, `SecretsReady`, `NetworkPolicyReady` (when network policy is enabled), `RBACReady`, `GatewayReady` (when any gateway is enabled), `ProfileStoreReady` (when Honcho is enabled), `WebhookReady`. Auto-update/backup/restore/migration conditions do **not** suppress Ready; they are advisory. |
-| False | `SubsystemsPending` | At least one subsystem condition is `False`. `message` lists the failing subsystems comma-separated. |
+| True | `AllSubsystemsReady` | Every required condition for the active spec reports `True`. The base set is `ConfigReady`, `SecretsReady`, `ServiceReady`, and `StatefulSetReady`, plus `StorageReady`, `NetworkPolicyReady`, and `RBACReady` when their default-enabled features are active. Optional PDB, HPA, Ingress, ServiceMonitor, PrometheusRule, ProfileStore, Backup, Restore, Migration, and AutoUpdate conditions suppress `Ready` whenever their corresponding feature is configured or in flight. |
+| False | `SubsystemsPending` | At least one required subsystem condition is missing or `False`. `message` lists the failing subsystems comma-separated. |
+| False | `SubsystemError` | A reconcile step failed before all resources could be applied. `message` names the failed subsystem and includes the controller error. |
 | False | `Suspended` | `spec.suspended=true`. The instance is intentionally scaled to zero; Ready is `False` so dashboards page on accidental suspension, not on intentional ones. The `message` says "Suspended by spec.suspended=true". |
-| Unknown | `Reconciling` | Set on first reconcile before subsystems have all reported. Transitions out within seconds. |
 
 Troubleshooting: `kubectl describe hi <name>` shows every subsystem condition.
 The failing ones drive the `message` of `Ready`.
 
 ### `StorageReady`
 
-The PVC backing `~/.hermes` is bound and matches spec.
+The data volume backing `~/.hermes` is reconciled. The operator creates a PVC
+unless persistence is disabled, in which case the pod uses `emptyDir`.
 
 | Status | Reason | When |
 |---|---|---|
-| True | `PVCBound` | The PVC for `~/.hermes` is `Bound` and its `spec.resources.requests.storage` matches the desired size. |
-| False | `PVCPending` | The PVC exists but has `status.phase=Pending`: typically because no `StorageClass` can provision the requested size in the current AZ. |
-| False | `PVCMismatch` | The bound PVC has a different `storageClassName` or `accessModes` than the spec asks for. The validator blocks new instances in this state; this condition fires on legacy instances created before validation tightened. |
-| False | `ExistingClaimNotFound` | `spec.storage.persistence.existingClaim` references a PVC that does not exist in the namespace. |
-| (absent) |: | `spec.storage.persistence.enabled=false`. The instance runs with an `emptyDir`. |
+| True | `Reconciled` | The operator-created PVC exists or was created for this reconcile. |
+| True | `Disabled` | `spec.storage.persistence.enabled=false`. The StatefulSet uses an `emptyDir` data volume and no data PVC is created. |
+| False | `Error` | Creating or reading the PVC failed. The `message` carries the API error. |
 
 Troubleshooting: `kubectl get pvc -l app.kubernetes.io/instance=<name>` and check
 `kubectl describe pvc <pvc>`.
@@ -61,10 +60,8 @@ The agent's `~/.hermes/config.yaml` ConfigMap is built and reflects the spec.
 
 | Status | Reason | When |
 |---|---|---|
-| True | `ConfigGenerated` | The operator-owned ConfigMap exists, the SHA of its `config.yaml` key matches `status.observedConfigHash`, and (if `spec.config.configMapRef` is set) the referenced ConfigMap resolves. |
-| False | `ConfigMapRefMissing` | `spec.config.configMapRef.name` does not exist in the namespace. |
-| False | `MergeFailure` | `spec.config.mergeMode=merge` failed to merge raw + ref (YAML conflict at a non-leaf node). The `message` includes the conflicting JSON path. |
-| False | `UnknownKey` | A key in `spec.config.raw` is not in the operator's known-schema. This is degraded-to-warning by default; flipped to `False` when `spec.config.strict=true`. |
+| True | `Reconciled` | The operator-owned agent config and workspace seed ConfigMaps were reconciled. Referenced `spec.config.configMapRef` and `spec.workspace.configMapRef` objects resolved. |
+| False | `Error` | The controller could not resolve `spec.config.configMapRef` or `spec.workspace.configMapRef`, or failed to reconcile one of the generated ConfigMaps. The `message` carries the API or merge error. |
 
 Troubleshooting: `kubectl get cm <name>-config -o yaml` shows the generated
 config. `kubectl describe hi <name>` shows the merge error if any.
@@ -75,12 +72,29 @@ All Secret references in the spec resolve.
 
 | Status | Reason | When |
 |---|---|---|
-| True | `AllSecretsResolved` | Every Secret referenced by `spec.envFrom`, `spec.gateways.*.secretRef`, `spec.backup.s3.credentialsSecretRef`, `spec.security.imagePullSecrets`, `spec.profileStore.secret`, and `spec.tailscale.authKey.secretRef` exists in the namespace and has the keys the schema expects. |
-| False | `SecretNotFound` | A referenced Secret does not exist. `message` lists `name=<x>, expectedBy=<spec.path>`. |
-| False | `SecretKeyMissing` | The Secret exists but is missing a key the schema requires (e.g. `accessKey` for S3 creds). |
-| False | `SecretRBACDenied` | The operator's ServiceAccount cannot `get` the Secret. Common in namespace-scoped installs. |
+| True | `Reconciled` | The operator-owned gateway token Secret exists and has the generated data shape. |
+| False | `Error` | Creating or updating the Secret failed. The `message` carries the API error. |
 
 Troubleshooting: `kubectl get secret <name>` and `kubectl auth can-i get secret/<name> --as=system:serviceaccount:<ns>:hermes-operator`.
+
+### `ServiceReady`
+
+The Service exposing the agent gateway is in place.
+
+| Status | Reason | When |
+|---|---|---|
+| True | `Reconciled` | The Service exists and matches the desired ports, labels, and annotations. |
+| False | `Error` | Creating or updating the Service failed. The `message` carries the API error. |
+
+### `StatefulSetReady`
+
+The agent StatefulSet exists and reports ready replicas.
+
+| Status | Reason | When |
+|---|---|---|
+| True | `Ready` | `status.readyReplicas == status.replicas` and `status.replicas > 0`. |
+| False | `StatefulSetNotReady` | The StatefulSet exists, but not every replica is ready yet. The `message` includes the ready and desired replica counts. |
+| False | `Suspended` | `spec.suspended=true`; the StatefulSet is scaled to zero intentionally. |
 
 ### `NetworkPolicyReady`
 
@@ -88,37 +102,75 @@ The default-deny + allow-list NetworkPolicy is in place.
 
 | Status | Reason | When |
 |---|---|---|
-| True | `Applied` | The NetworkPolicy named `<instance>-network` exists, has owner-ref pointing at the instance, and matches the spec (deny-all baseline + allow rules derived from `spec.gateways` and `spec.networking.egress`). |
-| False | `PolicyEngineMissing` | The cluster has no NetworkPolicy enforcer. The operator detects this by looking for known CNI annotations at startup. Falls back to warning if user has explicitly acknowledged via `spec.networking.networkPolicy.acknowledgeNoEnforcer=true`. |
-| (absent) |: | `spec.networking.networkPolicy.enabled=false`. |
+| True | `Reconciled` | The NetworkPolicy named `<instance>` exists, has owner-ref pointing at the instance, and matches the spec: deny-all baseline, DNS egress when allowed, `spec.security.networkPolicy.allowedEgressCIDRs`, `spec.security.networkPolicy.additionalEgress`, and the Honcho sibling rule when enabled. Gateway upstream egress is not derived from `spec.gateways`. |
+| True | `Disabled` | `spec.security.networkPolicy.enabled=false`; any operator-owned NetworkPolicy is deleted. |
+| False | `Error` | Creating, updating, or deleting the NetworkPolicy failed. |
 
 Troubleshooting: `kubectl get netpol -n <ns>` and verify the CNI supports
 NetworkPolicy.
 
 ### `RBACReady`
 
-The agent's ServiceAccount and (when SelfConfig is enabled) the Role+RoleBinding that lets the agent create `HermesSelfConfig` are in place.
+The agent's ServiceAccount, Role, and RoleBinding are in place when
+operator-created RBAC is enabled.
 
 | Status | Reason | When |
 |---|---|---|
-| True | `Applied` | The SA exists and (when `spec.selfConfigure.enabled=true`) the namespace-scoped Role and RoleBinding granting `create` on `hermesselfconfigs` exist with owner-ref. |
-| False | `SAAnnotationDrift` | The SA exists but its annotations have drifted from `spec.security.serviceAccount.annotations` because a third party overwrote them. The operator preserves third-party annotations on update; if the operator-owned set is missing it sets this status and re-applies. |
-| False | `RoleMissing` | `spec.selfConfigure.enabled=true` but the Role/RoleBinding could not be created (most often a webhook-rejected name conflict). |
+| True | `Reconciled` | The ServiceAccount, Role, and RoleBinding exist when operator-created RBAC is enabled. |
+| True | `Disabled` | `spec.security.rbac.createServiceAccount=false`; the operator does not create RBAC resources and the pod uses `spec.security.rbac.serviceAccountName` when set. |
+| False | `Error` | Creating or updating the ServiceAccount, Role, or RoleBinding failed. |
 
 Troubleshooting: `kubectl get sa,role,rolebinding -l app.kubernetes.io/instance=<name>`.
 
-### `GatewayReady`
+### `PDBReady`
 
-Per-platform gateway wiring (Telegram/Discord/Slack/WhatsApp/Signal).
+The optional PodDisruptionBudget is in place.
 
 | Status | Reason | When |
 |---|---|---|
-| True | `AllEnabledGatewaysWired` | Every gateway with `enabled=true` has its token Secret resolved, its generated config emitted into the agent ConfigMap, and its Service/Ingress allowances applied. |
-| False | `TokenSecretMissing` | At least one enabled gateway's `secretRef` does not resolve. `message` names the gateways. |
-| False | `IngressUnsupportedForPlatform` | A gateway requested an Ingress (e.g. Slack's events webhook) but `spec.networking.ingress.enabled=false`. The webhook normally rejects this combination; the condition fires on legacy resources. |
-| (absent) |: | No gateway has `enabled=true`. |
+| True | `Reconciled` | `spec.availability.podDisruptionBudget.enabled=true` and the PDB exists with the desired spec. |
+| True | `Disabled` | The PDB feature is disabled and any operator-owned PDB is deleted. |
+| False | `Error` | Creating, updating, or deleting the PDB failed. |
 
-Troubleshooting: `kubectl describe hi <name>` and check the per-gateway sub-status in `status.gateways[].*`.
+### `HPAReady`
+
+The optional HorizontalPodAutoscaler is in place.
+
+| Status | Reason | When |
+|---|---|---|
+| True | `Reconciled` | `spec.availability.horizontalPodAutoscaler.enabled=true` and the HPA exists with the desired metrics and behavior. |
+| True | `Disabled` | The HPA feature is disabled and any operator-owned HPA is deleted. |
+| False | `Error` | Creating, updating, or deleting the HPA failed. |
+
+### `IngressReady`
+
+The optional Ingress is in place.
+
+| Status | Reason | When |
+|---|---|---|
+| True | `Reconciled` | `spec.networking.ingress.enabled=true` and the Ingress exists with the desired rules. |
+| True | `Disabled` | The Ingress feature is disabled and any operator-owned Ingress is deleted. |
+| False | `Error` | Creating, updating, or deleting the Ingress failed. |
+
+### `ServiceMonitorReady`
+
+The optional Prometheus Operator ServiceMonitor is in place.
+
+| Status | Reason | When |
+|---|---|---|
+| True | `Reconciled` | The Prometheus Operator CRD is installed, `spec.observability.serviceMonitor.enabled=true`, and the ServiceMonitor exists. |
+| True | `Disabled` | The feature is disabled or the ServiceMonitor CRD is not installed. |
+| False | `Error` | Creating, updating, or deleting the ServiceMonitor failed. |
+
+### `PrometheusRuleReady`
+
+The optional Prometheus Operator PrometheusRule is in place.
+
+| Status | Reason | When |
+|---|---|---|
+| True | `Reconciled` | The Prometheus Operator CRD is installed, `spec.observability.prometheusRule.enabled=true`, and the PrometheusRule exists. |
+| True | `Disabled` | The feature is disabled or the PrometheusRule CRD is not installed. |
+| False | `Error` | Creating, updating, or deleting the PrometheusRule failed. |
 
 ### `ProfileStoreReady`
 
@@ -126,11 +178,10 @@ Honcho profile-store companion deployment.
 
 | Status | Reason | When |
 |---|---|---|
-| True | `HonchoReady` | The Honcho Deployment reports `availableReplicas >= 1`, its Service exists, its PVC (if persistence enabled) is bound, and the Secret holding the API key is present. |
-| False | `HonchoPending` | The Honcho Deployment is rolling out. |
-| False | `HonchoImagePullBackOff` | The Honcho image cannot be pulled. The operator distinguishes this from generic `HonchoPending` so dashboards alert on it. |
-| False | `HonchoSecretMissing` | `spec.profileStore.secret` references a Secret that does not exist. |
-| (absent) |: | `spec.profileStore.enabled=false`. |
+| True | `Disabled` | `spec.profileStore.honcho.enabled=false`; Honcho Deployment and Service are deleted while the Honcho PVC is retained for data safety. |
+| True | `Ready` | The Honcho Deployment has at least one ready replica. |
+| False | `DeploymentNotReady` | The Honcho Deployment is missing or has no ready replicas yet. The `message` includes the observed replica counts or API error. |
+| False | `Error` | Creating, updating, or deleting Honcho resources failed. |
 
 Troubleshooting: `kubectl get deploy,svc,pvc,secret -l app.kubernetes.io/instance=<name>,app.kubernetes.io/component=honcho`.
 
@@ -140,11 +191,11 @@ State of scheduled backups (from Plan 5, restated here for the catalogue).
 
 | Status | Reason | When |
 |---|---|---|
-| True | `Scheduled` | A backup CronJob is configured and the most recent run succeeded. `status.backup.lastSuccessfulSnapshotKey` is populated. |
-| False | `S3CredentialsMissing` | `spec.backup.s3.credentialsSecretRef` does not resolve. |
-| False | `PersistenceDisabled` | `spec.storage.persistence.enabled=false`: scheduled backups require persistence. |
-| False | `LastRunFailed` | The most recent backup Job exited non-zero. `status.backup.lastFailureReason` carries the detail. |
-| (absent) |: | `spec.backup.schedule` is empty. |
+| True | `Scheduled` | `spec.backup.schedule` is set, `spec.backup.s3` is configured, persistence is enabled, and the backup and prune CronJobs are reconciled. |
+| True | `OnDeleteConfigured` | `spec.backup.onDelete=true`, `spec.backup.s3` is configured, and persistence is enabled. No scheduled CronJob is required. |
+| False | `S3NotConfigured` | Scheduled backups or final backup on delete are enabled, but `spec.backup.s3` is unset. |
+| False | `PersistenceDisabled` | Scheduled backups or final backup on delete are enabled, but `spec.storage.persistence.enabled=false`. Backup CronJobs are deleted. |
+| (absent) |: | Neither `spec.backup.schedule` nor `spec.backup.onDelete` is set. |
 
 Troubleshooting: `kubectl get cj,job -l app.kubernetes.io/instance=<name>,backup=true` and `kubectl logs job/<last-run>`.
 
@@ -155,8 +206,9 @@ Terminal: once `True`, immutable for the lifetime of the instance.
 | Status | Reason | When |
 |---|---|---|
 | True | `RestoreCompleted` | `status.restoredFrom == spec.restoreFrom`. |
+| False | `WaitingForPod` | `spec.restoreFrom` is set, but the StatefulSet pod is not visible yet. The controller requeues quickly. |
 | False | `Restoring` | The `init-restore` init container is in progress. |
-| False | `RestoreFailed` | The `init-restore` init container exited non-zero. The `message` includes the exit code and the last line of `kubectl logs`. |
+| False | `RestoreFailed` | The `init-restore` init container exited non-zero. The `message` includes the exit code and the container termination message. |
 | (absent) |: | `spec.restoreFrom` is unset. |
 
 Troubleshooting: `kubectl logs <instance>-0 -c init-restore` and inspect the snapshot key in S3.
@@ -168,7 +220,7 @@ Outcome of the most recent auto-update cycle.
 | Status | Reason | When |
 |---|---|---|
 | True | `UpToDate` | The current tag is the highest in `spec.autoUpdate.source.channel`. No rollout needed. |
-| True | `Confirmed` | A rollout completed and passed the readiness watch window. `status.autoUpdate.lastConfirmedTag` is populated. |
+| True | `Confirmed` | A rollout completed and passed the readiness watch window. `status.autoUpdate.lastSuccessTag` is populated. |
 | False | `RolloutInFlight` | A rollout is currently being watched. `status.autoUpdate.targetTag` carries the candidate. |
 | False | `RolledBack` | The most recent rollout failed; image reverted. The `message` references the failed tag. |
 | False | `NoMatchingTag` | No tag in the registry matches the channel pattern. |
@@ -194,23 +246,12 @@ Terminal: once `True`, immutable for the lifetime of the instance.
 | Status | Reason | When |
 |---|---|---|
 | True | `MigrationCompleted` | The `init-migrate-from-openclaw` init container exited 0. |
-| False | `MigrationFailed` | The migration init container exited non-zero. The `message` includes the exit code and a short tail of the init container's stderr. |
+| False | `WaitingForPod` | `spec.migration.fromOpenClaw` is set, but the StatefulSet pod is not visible yet. The controller requeues quickly. |
+| False | `Migrating` | The migration init container has not terminated yet. |
+| False | `MigrationFailed` | The migration init container exited non-zero. The `message` includes the exit code and the container termination message. |
 | (absent) |: | `spec.migration.fromOpenClaw` is unset. |
 
 Troubleshooting: `kubectl logs <instance>-0 -c init-migrate-from-openclaw`.
-
-### `WebhookReady`
-
-Reflects the operator's ability to serve the admission webhooks for this CR. This condition fires when the webhook serving cert is invalid or the webhook server is unreachable: it is a *cluster-level* failure surfaced per-instance so consumers do not have to know about the operator's pod state.
-
-| Status | Reason | When |
-|---|---|---|
-| True | `WebhookHealthy` | The operator's webhook server returned `200` to its own self-check probe within the last `RequeueAfter`. |
-| False | `CertExpired` | The webhook serving cert's `notAfter` is in the past. cert-manager (when enabled) usually rotates before this fires; when it fires, manual intervention is required. |
-| False | `EndpointUnreachable` | The webhook Service has no Endpoints: usually because the operator Pod is not Ready. |
-| Unknown | `SelfCheckPending` | First reconcile before the self-check has run. |
-
-Troubleshooting: `kubectl get validatingwebhookconfiguration,mutatingwebhookconfiguration | grep hermes` and `kubectl logs -n hermes-operator deploy/hermes-operator-controller-manager`.
 
 ---
 
@@ -271,6 +312,6 @@ The two conditions can both be `True` simultaneously: `Active=True` (defaults ar
 For consistency across CRs and to make grep work in dashboards:
 
 - **PascalCase**, no spaces, no slashes (allow underscore only for value-carrying reasons like `RolledBackFrom_<tag>`).
-- **One token per cause.** "PVCBoundAndSizeMatches" is wrong; the reason is `PVCBound`, the size match is implicit.
-- **Reasons are added, never repurposed.** Adding `S3RegionInvalid` as a new reason for `BackupReady=False` is non-breaking. Changing what `S3CredentialsMissing` means is breaking.
+- **One token per cause.** "ScheduledAndS3Configured" is wrong; the reason is `Scheduled`, and the configured backend is implicit.
+- **Reasons are added, never repurposed.** Adding `S3EndpointInvalid` as a new reason for `BackupReady=False` is non-breaking. Changing what `S3NotConfigured` means is breaking.
 - **Reasons that embed values** use `_` as the separator (the only allowed underscore use).

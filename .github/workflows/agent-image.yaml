@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       hermes_version:
-        description: "Upstream hermes-agent release tag (e.g. v0.13.0)"
+        description: "Upstream hermes-agent release tag (e.g. v2026.5.29.2)"
         required: true
         type: string
   push:
@@ -28,7 +28,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
       - name: Resolve HERMES_VERSION
         id: ver
@@ -45,33 +45,45 @@ jobs:
           echo "bare=${bare}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Verify uv.lock matches the requested HERMES_VERSION
+        env:
+          HERMES_TAG: ${{ steps.ver.outputs.tag }}
         run: |
           set -eux
           # The lockfile is the source of truth; refuse to ship if the committed lock
-          # disagrees with the requested version.
-          ver=$(awk '/^name = "hermes-agent"$/{getline; if ($0 ~ /^version =/) {gsub(/[" ]/, "", $3); print $3; exit}}' images/hermes-agent/uv.lock)
-          if [ "${ver}" != "${{ steps.ver.outputs.bare }}" ]; then
-            echo "uv.lock pins hermes-agent==${ver} but workflow requested ${{ steps.ver.outputs.bare }}" >&2
-            echo "Run: make agent-image-relock HERMES_VERSION=${{ steps.ver.outputs.tag }} and commit." >&2
+          # disagrees with the requested upstream git tag.
+          if [ ! -f images/hermes-agent/uv.lock ]; then
+            echo "images/hermes-agent/uv.lock is required. Run: make agent-image-relock HERMES_VERSION=${HERMES_TAG} and commit it." >&2
+            exit 1
+          fi
+          lock_rev_line="requires-dist = [{ name = \"hermes-agent\", git = \"https://github.com/NousResearch/hermes-agent?rev=${HERMES_TAG}\" }]"
+          if ! grep -Fqx "${lock_rev_line}" images/hermes-agent/uv.lock; then
+            echo "uv.lock does not contain the exact hermes-agent rev line for ${HERMES_TAG}" >&2
+            echo "Run: make agent-image-relock HERMES_VERSION=${HERMES_TAG} and commit." >&2
+            exit 1
+          fi
+          pyproject_dep_line="    \"hermes-agent @ git+https://github.com/NousResearch/hermes-agent@${HERMES_TAG}\","
+          if ! grep -Fqx "${pyproject_dep_line}" images/hermes-agent/pyproject.toml; then
+            echo "pyproject.toml does not contain the exact hermes-agent dependency line for ${HERMES_TAG}" >&2
+            echo "Run: make agent-image-relock HERMES_VERSION=${HERMES_TAG} and commit." >&2
             exit 1
           fi
 
       - name: Build and push
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25
         with:
           context: images/hermes-agent
           file: images/hermes-agent/Dockerfile
@@ -79,34 +91,44 @@ jobs:
           push: true
           tags: |
             ghcr.io/paperclipinc/hermes-agent:${{ steps.ver.outputs.tag }}
-            ghcr.io/paperclipinc/hermes-agent:latest
           build-args: |
             HERMES_VERSION=${{ steps.ver.outputs.tag }}
           provenance: true
           sbom: true
 
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
-
-      - name: Sign image (keyless OIDC)
+      - name: Compute immutable image reference
+        id: image_ref
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          cosign sign --yes "ghcr.io/paperclipinc/hermes-agent@${DIGEST}"
+          set -eu
+          test -n "${DIGEST}"
+          echo "ref=ghcr.io/paperclipinc/hermes-agent@${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
+
+      - name: Sign image (keyless OIDC)
+        env:
+          IMAGE_REF: ${{ steps.image_ref.outputs.ref }}
+        run: |
+          cosign sign --yes "${IMAGE_REF}"
 
       - name: Install Syft
-        uses: anchore/sbom-action/download-syft@v0
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610
 
       - name: Generate SBOM
+        env:
+          IMAGE_REF: ${{ steps.image_ref.outputs.ref }}
         run: |
-          syft "ghcr.io/paperclipinc/hermes-agent:${{ steps.ver.outputs.tag }}" \
+          syft "${IMAGE_REF}" \
             -o spdx-json=sbom.spdx.json
 
       - name: Attach SBOM as Cosign attestation
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_REF: ${{ steps.image_ref.outputs.ref }}
         run: |
           cosign attest --yes \
             --predicate sbom.spdx.json \
             --type spdxjson \
-            "ghcr.io/paperclipinc/hermes-agent@${DIGEST}"
+            "${IMAGE_REF}"

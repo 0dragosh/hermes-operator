@@ -90,6 +90,7 @@ type SelfConfigSkill struct {
 }
 
 // SelfConfigEnvVar is an environment variable entry.
+// +kubebuilder:validation:XValidation:rule="has(self.value) != has(self.valueFrom)",message="set exactly one of value or valueFrom"
 type SelfConfigEnvVar struct {
 	// Name of the environment variable. Must be a C_IDENTIFIER.
 	// +kubebuilder:validation:MinLength=1
@@ -98,7 +99,7 @@ type SelfConfigEnvVar struct {
 
 	// Value is the literal value. Mutually exclusive with ValueFrom.
 	// +optional
-	Value string `json:"value,omitempty"`
+	Value *string `json:"value,omitempty"`
 
 	// ValueFrom selects a value from a Secret or ConfigMap key.
 	// +optional
@@ -106,6 +107,7 @@ type SelfConfigEnvVar struct {
 }
 
 // SelfConfigEnvVarSource selects a Secret or ConfigMap key. Exactly one ref must be set.
+// +kubebuilder:validation:XValidation:rule="has(self.secretKeyRef) != has(self.configMapKeyRef)",message="set exactly one of secretKeyRef or configMapKeyRef"
 type SelfConfigEnvVarSource struct {
 	// +optional
 	SecretKeyRef *SelfConfigKeySelector `json:"secretKeyRef,omitempty"`
@@ -122,16 +124,17 @@ type SelfConfigKeySelector struct {
 }
 
 // SelfConfigWorkspaceFile is a single file to materialise into the workspace.
+// +kubebuilder:validation:XValidation:rule="has(self.content) != has(self.contentFrom)",message="set exactly one of content or contentFrom"
 type SelfConfigWorkspaceFile struct {
 	// Path is the relative path under ~/.hermes/workspace/.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=512
-	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9._/-]+$`
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$`
 	Path string `json:"path"`
 
 	// Content is the literal file body.
 	// +optional
-	Content string `json:"content,omitempty"`
+	Content *string `json:"content,omitempty"`
 
 	// ContentFrom reads the file body from a Secret key.
 	// +optional
@@ -142,6 +145,7 @@ type SelfConfigWorkspaceFile struct {
 type SelfConfigProfileSnapshot struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	ProfileID string `json:"profileID"`
 
 	// Data is the opaque snapshot payload.

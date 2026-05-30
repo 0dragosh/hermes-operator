@@ -1,7 +1,7 @@
 # Build the manager binary. Use BUILDPLATFORM so Go cross-compiles natively
 # rather than running the whole compile under QEMU emulation, which is
 # pathologically slow for Go.
-FROM --platform=$BUILDPLATFORM golang:1.26 AS builder
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26@sha256:2d6c80227255c3112a4d08e67ba98e58efd3846daf15d9d7d4c389565d881b1a AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -17,7 +17,7 @@ COPY internal/ internal/
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
     go build -a -ldflags="-s -w" -o /workspace/manager cmd/main.go
 
-FROM gcr.io/distroless/static:nonroot
+FROM gcr.io/distroless/static:nonroot@sha256:963fa6c544fe5ce420f1f54fb88b6fb01479f054c8056d0f74cc2c6000df5240
 WORKDIR /
 COPY --from=builder /workspace/manager .
 USER 65532:65532

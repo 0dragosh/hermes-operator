@@ -24,6 +24,7 @@ import (
 	. "github.com/onsi/gomega"
 	batchv1 "k8s.io/api/batch/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -82,6 +83,7 @@ var _ = Describe("Backup sub-controller", func() {
 		Eventually(func() error {
 			return k8sClient.Get(ctx, types.NamespacedName{Name: bName, Namespace: namespace}, inst)
 		}, timeout, interval).Should(Satisfy(apierrors.IsNotFound))
+		cleanupHermesInstanceOwnedResources(ctx, bName, namespace)
 	})
 
 	Context("CronJob lifecycle", func() {
@@ -103,9 +105,13 @@ var _ = Describe("Backup sub-controller", func() {
 			Expect(k8sClient.Create(ctx, inst)).To(Succeed())
 
 			cronJobName := resources.BackupCronJobName(inst)
+			pruneCronJobName := resources.BackupPruneCronJobName(inst)
 			cj := &batchv1.CronJob{}
 			Eventually(func() error {
 				return k8sClient.Get(ctx, types.NamespacedName{Name: cronJobName, Namespace: namespace}, cj)
+			}, timeout, interval).Should(Succeed())
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{Name: pruneCronJobName, Namespace: namespace}, cj)
 			}, timeout, interval).Should(Succeed())
 
 			// Now clear the schedule
@@ -120,6 +126,36 @@ var _ = Describe("Backup sub-controller", func() {
 				err := k8sClient.Get(ctx, types.NamespacedName{Name: cronJobName, Namespace: namespace}, cj)
 				return apierrors.IsNotFound(err)
 			}, timeout, interval).Should(BeTrue())
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: pruneCronJobName, Namespace: namespace}, cj)
+				return apierrors.IsNotFound(err)
+			}, timeout, interval).Should(BeTrue())
+		})
+
+		It("does not create backup CronJobs when persistence is disabled", func() {
+			inst := newBackupInstance("0 2 * * *")
+			inst.Spec.Storage.Persistence.Enabled = Ptr(false)
+			Expect(k8sClient.Create(ctx, inst)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				fresh := &hermesv1.HermesInstance{}
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: bName, Namespace: namespace}, fresh)).To(Succeed())
+				cond := meta.FindStatusCondition(fresh.Status.Conditions, hermesv1.ConditionBackupReady)
+				g.Expect(cond).NotTo(BeNil())
+				g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+				g.Expect(cond.Reason).To(Equal("PersistenceDisabled"))
+			}, timeout, interval).Should(Succeed())
+
+			Consistently(func() bool {
+				cj := &batchv1.CronJob{}
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: resources.BackupCronJobName(inst), Namespace: namespace}, cj)
+				return apierrors.IsNotFound(err)
+			}, time.Second, 100*time.Millisecond).Should(BeTrue())
+			Consistently(func() bool {
+				cj := &batchv1.CronJob{}
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: resources.BackupPruneCronJobName(inst), Namespace: namespace}, cj)
+				return apierrors.IsNotFound(err)
+			}, time.Second, 100*time.Millisecond).Should(BeTrue())
 		})
 	})
 
@@ -146,6 +182,48 @@ var _ = Describe("Backup sub-controller", func() {
 			// generation should remain at 1 (created): a Patch on finalizers only does NOT bump generation
 			Expect(fetched.Generation).To(Equal(int64(1)),
 				"lesson #437: finalizer patch must NOT use Update which bumps metadata.generation")
+		})
+
+		It("removes the finalizer when backup.onDelete is turned off", func() {
+			inst := newBackupInstance("")
+			inst.Spec.Backup.OnDelete = true
+			Expect(k8sClient.Create(ctx, inst)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				fetched := &hermesv1.HermesInstance{}
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: bName, Namespace: namespace}, fetched)).To(Succeed())
+				g.Expect(fetched.Finalizers).To(ContainElement(hermesv1.FinalizerBackupOnDelete))
+			}, timeout, interval).Should(Succeed())
+
+			fresh := &hermesv1.HermesInstance{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: bName, Namespace: namespace}, fresh)).To(Succeed())
+			original := fresh.DeepCopy()
+			fresh.Spec.Backup.OnDelete = false
+			Expect(k8sClient.Patch(ctx, fresh, client.MergeFrom(original))).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				fetched := &hermesv1.HermesInstance{}
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: bName, Namespace: namespace}, fetched)).To(Succeed())
+				g.Expect(fetched.Finalizers).NotTo(ContainElement(hermesv1.FinalizerBackupOnDelete))
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("skips a stale final backup finalizer when persistence is disabled", func() {
+			inst := newBackupInstance("")
+			inst.Spec.Backup.OnDelete = true
+			inst.Spec.Storage.Persistence.Enabled = Ptr(false)
+			inst.Finalizers = []string{hermesv1.FinalizerBackupOnDelete}
+			Expect(k8sClient.Create(ctx, inst)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				fetched := &hermesv1.HermesInstance{}
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: bName, Namespace: namespace}, fetched)).To(Succeed())
+				g.Expect(fetched.Finalizers).NotTo(ContainElement(hermesv1.FinalizerBackupOnDelete))
+			}, timeout, interval).Should(Succeed())
+
+			job := &batchv1.Job{}
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: FinalBackupJobName(inst), Namespace: namespace}, job)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
 		})
 	})
 })

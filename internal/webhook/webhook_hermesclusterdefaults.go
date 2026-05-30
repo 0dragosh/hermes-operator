@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -35,5 +36,21 @@ func validateHCD(obj runtime.Object) (admission.Warnings, error) {
 	if hcd.Name != "cluster" {
 		return nil, fmt.Errorf("HermesClusterDefaults must be the singleton named \"cluster\" (got %q)", hcd.Name)
 	}
+	if err := validateHCDImageDefaults(hcd.Spec.Image); err != nil {
+		return nil, err
+	}
 	return nil, nil
+}
+
+func validateHCDImageDefaults(image hermesv1.ImageSpec) error {
+	if strings.Contains(image.Repository, "@sha256:") && !hermesv1.ImageRepositoryUsesDigest(image.Repository) {
+		return fmt.Errorf("spec.image.repository digest references must use @sha256:<64 lowercase hex chars>")
+	}
+	if image.Tag == "latest" {
+		return fmt.Errorf("spec.image.tag must not be \"latest\" for HermesClusterDefaults image defaults")
+	}
+	if image.Repository != "" && !hermesv1.ImageRepositoryUsesDigest(image.Repository) && image.Tag == "" {
+		return fmt.Errorf("spec.image.tag is required when HermesClusterDefaults sets a tag-based image repository")
+	}
+	return nil
 }

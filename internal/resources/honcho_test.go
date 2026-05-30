@@ -92,6 +92,42 @@ func TestBuildHonchoDeployment(t *testing.T) {
 	}
 }
 
+func TestBuildHonchoDeployment_DefaultUsesPVC(t *testing.T) {
+	inst := instWithHoncho(hermesv1.HonchoSpec{Enabled: Ptr(true)})
+	dep := BuildHonchoDeployment(inst)
+
+	var dataVolume *corev1.Volume
+	for i, v := range dep.Spec.Template.Spec.Volumes {
+		if v.Name == "honcho-data" {
+			dataVolume = &dep.Spec.Template.Spec.Volumes[i]
+		}
+	}
+	if assert.NotNil(t, dataVolume) {
+		assert.NotNil(t, dataVolume.PersistentVolumeClaim)
+		assert.Nil(t, dataVolume.EmptyDir)
+		assert.Equal(t, "demo-honcho-data", dataVolume.PersistentVolumeClaim.ClaimName)
+	}
+}
+
+func TestBuildHonchoDeployment_PersistenceDisabledUsesEmptyDir(t *testing.T) {
+	inst := instWithHoncho(hermesv1.HonchoSpec{
+		Enabled:     Ptr(true),
+		Persistence: hermesv1.HonchoPersistenceSpec{Enabled: Ptr(false)},
+	})
+	dep := BuildHonchoDeployment(inst)
+
+	var dataVolume *corev1.Volume
+	for i, v := range dep.Spec.Template.Spec.Volumes {
+		if v.Name == "honcho-data" {
+			dataVolume = &dep.Spec.Template.Spec.Volumes[i]
+		}
+	}
+	if assert.NotNil(t, dataVolume) {
+		assert.NotNil(t, dataVolume.EmptyDir)
+		assert.Nil(t, dataVolume.PersistentVolumeClaim)
+	}
+}
+
 func TestBuildHonchoConsumerEnv(t *testing.T) {
 	inst := instWithHoncho(hermesv1.HonchoSpec{
 		Enabled: Ptr(true),

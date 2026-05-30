@@ -6,25 +6,24 @@
 # copies only the venv + minimal apt deps and runs as the non-root `hermes` user.
 #
 # Build args:
-#   HERMES_VERSION  : the exact hermes-agent release to package (e.g. "1.4.3").
-#                     Required. The CI workflow at .github/workflows/agent-image.yaml
-#                     drives this from a matrix.
-#   PYTHON_VERSION  : Python interpreter version. Default 3.11.
-#   UV_VERSION      : uv tool version. Default 0.5.0 (pinned for reproducibility).
+#   HERMES_VERSION  : the exact hermes-agent git tag to label. Defaults to the
+#                     repository-pinned tag; CI overrides it from the matrix.
+#   PYTHON_IMAGE    : digest-pinned Python runtime image.
+#   UV_IMAGE        : digest-pinned uv image copied into the builder.
 #   TINI_VERSION    : tini release tag (lesson openclaw #471: tini as PID 1).
 #
 # Output: a runtime image that, with no further configuration, runs
 #         `hermes-agent --config ~/.hermes/config.yaml` as UID 1000.
 
-ARG PYTHON_VERSION=3.11
-ARG UV_VERSION=0.5.0
+ARG PYTHON_IMAGE=docker.io/library/python:3.11-slim-bookworm@sha256:8dca233de9f3d9bb410665f00a4da6dd06f331083137e0e98ccf227236fcc438
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.11.16@sha256:440fd6477af86a2f1b38080c539f1672cd22acb1b1a47e321dba5158ab08864d
 ARG TINI_VERSION=v0.19.0
-ARG HERMES_VERSION
+ARG HERMES_VERSION=v2026.5.29.2
 
 # ---------- Stage 1: builder ----------
-FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+FROM ${UV_IMAGE} AS uv
 
-FROM python:${PYTHON_VERSION}-slim-bookworm AS builder
+FROM ${PYTHON_IMAGE} AS builder
 ARG HERMES_VERSION
 
 # uv binary from the dedicated stage above.
@@ -33,14 +32,15 @@ COPY --from=uv /uv /uvx /usr/local/bin/
 ENV UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1 \
     UV_PYTHON_DOWNLOADS=never \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
     VIRTUAL_ENV=/opt/venv
 
 WORKDIR /build
 
 # git + ca-certificates are needed at lock-resolve time because the lockfile
 # pins hermes-agent by git ref (upstream is not on PyPI).
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates \
+RUN apt-get -o APT::Sandbox::User=root update \
+    && apt-get -o APT::Sandbox::User=root install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy lockfile + project metadata first for layer caching.
@@ -54,11 +54,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     if [ -z "${HERMES_VERSION}" ]; then \
         echo "ERROR: HERMES_VERSION build-arg is required" >&2; exit 1; \
     fi; \
-    uv venv /opt/venv; \
     uv sync --frozen --no-dev
 
 # ---------- Stage 2: runtime ----------
-FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
+FROM ${PYTHON_IMAGE} AS runtime
 ARG TINI_VERSION
 ARG HERMES_VERSION
 ARG TARGETARCH
@@ -66,14 +65,19 @@ ARG TARGETARCH
 # Runtime apt packages:
 #   - ffmpeg, ripgrep: hard dependencies of hermes-agent (audio + search)
 #   - git, openssh-client: hermes-agent skill installs are git-based
+#   - awscli, zstd, tar, coreutils: backup/restore object transfer tools
 #   - ca-certificates: TLS to platform gateways
 #   - tini: PID 1 reaper (lesson openclaw-operator #471)
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+RUN apt-get -o APT::Sandbox::User=root update \
+    && apt-get -o APT::Sandbox::User=root install -y --no-install-recommends \
+        awscli \
         ffmpeg \
         ripgrep \
         git \
         openssh-client \
+        zstd \
+        tar \
+        coreutils \
         ca-certificates \
         tini \
     && rm -rf /var/lib/apt/lists/*
@@ -85,7 +89,9 @@ RUN groupadd --system --gid 1000 hermes \
     && chown -R hermes:hermes /home/hermes
 
 # Copy the resolved venv from the builder stage.
+COPY --from=uv /uv /uvx /usr/local/bin/
 COPY --from=builder --chown=hermes:hermes /opt/venv /opt/venv
+COPY --from=builder --chown=hermes:hermes /build/pyproject.toml /build/uv.lock /opt/venv-template/
 ENV PATH="/opt/venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

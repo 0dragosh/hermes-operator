@@ -21,19 +21,12 @@ kubectl create secret generic hermes-discord \
 # S3 backup credentials.
 kubectl create secret generic hermes-s3-creds \
   -n agents \
-  --from-literal=accessKey=REPLACE \
-  --from-literal=secretKey=REPLACE
+  --from-literal=S3_ACCESS_KEY_ID=REPLACE \
+  --from-literal=S3_SECRET_ACCESS_KEY=REPLACE
 
 # Honcho secret.
 kubectl create secret generic hermes-honcho \
   -n agents --from-literal=apiKey=REPLACE
-
-# Image pull secret (if your registry needs auth).
-kubectl create secret docker-registry ghcr-pull \
-  -n agents \
-  --docker-server=ghcr.io \
-  --docker-username=YOUR_GITHUB_USERNAME \
-  --docker-password=YOUR_GITHUB_PAT
 ```
 
 ## Apply
@@ -46,22 +39,20 @@ kubectl apply -n agents -f hermesinstance.yaml
 
 | Sub-spec | What |
 |---|---|
-| `image` | Pinned tag + image pull secret. |
+| `image` | Pinned tag + pull policy. |
 | `config` | Raw inline + merge mode. |
 | `workspace` | Two seeded files. |
 | `resources` | Explicit requests + limits. |
-| `security` | Pod + container security context, SA annotation (IRSA). |
+| `security` | Pod + container security context, RBAC annotation (IRSA), NetworkPolicy with explicit egress. |
 | `storage` | 50Gi GP3 PVC. |
-| `networking` | Ingress + NetworkPolicy egress allow-list. |
+| `networking` | Service + Ingress settings. |
 | `observability` | Metrics + ServiceMonitor. |
 | `availability` | PDB + HPA + topology spread. |
 | `probes` | Custom liveness/readiness. |
 | `backup` | Scheduled + on-delete + pre-update, with history limit. |
-| `runtime` | Pinned Python + extra apt + extra pip. |
+| `runtime` | Pinned Python + uv dependency checks + extra pip packages. |
 | `gateways` | Telegram + Discord. |
 | `profileStore` | Honcho with persistence. |
-| `webTerminal` | Enabled (attach via `kubectl attach`). |
-| `tailscale` | Tailscale Serve. |
 | `autoUpdate` | Channel-pinned with rollback. |
 | `selfConfigure` | Enabled with a strict `protectedKeys`. |
 | `scheduling` | Node selector + toleration. |

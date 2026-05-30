@@ -6,7 +6,7 @@ The `hermes-operator` ships an S3-compatible backup subsystem with three trigger
 2. **On delete**: via `spec.backup.onDelete = true` (`hermes.agent/backup-on-delete` finalizer).
 3. **Pre-update**: automatic when `spec.autoUpdate.backupBeforeUpdate = true` (default).
 
-All three paths produce a `tar.zst` snapshot of `/home/hermes/.hermes/` plus a `meta.json` sidecar, written to S3 under a deterministic key. The format is documented in [`docs/backup-format.md`](backup-format.md).
+All three paths produce a raw `.tar.zst` archive of `/home/hermes/.hermes/` with a `meta.json` entry, written to S3 under a deterministic object key. The format is documented in [`docs/backup-format.md`](backup-format.md). The backup bucket contains archive objects only, not repository metadata prefixes such as `config/`, `data/`, `index/`, or `snapshots/`.
 
 ## Configuration
 
@@ -49,7 +49,7 @@ spec:
   restoreFrom: "prod/agents/my-hermes/2026-05-10T03-00-00Z.tar.zst"
 ```
 
-On the next reconcile, the operator injects an `init-restore` init container into the StatefulSet PodTemplate. It downloads + extracts the snapshot to the PVC at `/home/hermes/.hermes/`. When the init container exits 0, `status.restoredFrom` is latched. The field becomes immutable thereafter: see [API stability](#api-stability).
+On the next reconcile, the operator injects an `init-restore` init container into the StatefulSet PodTemplate. It downloads the raw `.tar.zst` object and extracts it to the PVC at `/home/hermes/.hermes/`. When the init container exits 0, `status.restoredFrom` is latched. The field becomes immutable thereafter: see [API stability](#api-stability).
 
 ### Empty-PVC guard
 
@@ -92,14 +92,14 @@ A `Warning` event is recorded so post-mortem reviewers see it. **Use this only i
 
 ## History pruning
 
-A second CronJob (`<name>-backup-prune`) runs daily at 04:17 UTC and runs `restic forget --keep-last <historyLimit>` on the successful snapshot tags, and `--keep-last <failedHistoryLimit>` on the `failed/` prefix.
+A second CronJob (`<name>-backup-prune`) runs daily at 04:17 UTC. It lists raw `.tar.zst` objects under the successful snapshot prefix, keeps the newest `historyLimit` keys by lexicographic timestamp order, and deletes older keys. It repeats the same process under the `failed/` prefix using `failedHistoryLimit`.
 
 ## Common pitfalls
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | Final backup Job fails with `S3 credentials secret missing key`. | Secret missing `S3_ACCESS_KEY_ID` or `S3_SECRET_ACCESS_KEY`. | Patch the Secret. The CR stays in deletion until the next reconcile picks up the new Secret. |
-| Scheduled CronJob runs but no snapshot appears. | Likely a network policy blocking egress to S3 endpoint. | Add an egress rule under `spec.networking.egress`. |
+| Scheduled CronJob runs but no snapshot appears. | Likely a NetworkPolicy blocking egress to the S3 endpoint. | Add egress under `spec.security.networkPolicy.allowedEgressCIDRs` or `spec.security.networkPolicy.additionalEgress`. |
 | `kubectl delete` hangs forever. | Final backup Job failing repeatedly. | `kubectl describe job <name>-backup-final` for logs; either fix or use the skip annotation. |
 | `status.restoredFrom` stays empty after `init-restore` exited 0. | Pod restarted before the operator observed the terminated state. | Force reconcile: `kubectl annotate hermesinstance <name> poke=$(date +%s) --overwrite`. |
 

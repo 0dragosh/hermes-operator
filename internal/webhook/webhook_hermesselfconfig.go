@@ -8,10 +8,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
@@ -29,6 +31,8 @@ type HermesSelfConfigValidator struct {
 }
 
 var _ admission.CustomValidator = (*HermesSelfConfigValidator)(nil)
+
+var selfConfigProfileIDPattern = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 
 func (v *HermesSelfConfigValidator) ValidateCreate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
 	return v.validate(ctx, obj)
@@ -50,6 +54,17 @@ func (v *HermesSelfConfigValidator) validate(ctx context.Context, obj runtime.Ob
 
 	if sc.Spec.InstanceRef == "" {
 		return nil, fmt.Errorf("spec.instanceRef is required")
+	}
+
+	if errs := validateSelfConfigValueSources(sc); len(errs) > 0 {
+		return nil, errs.ToAggregate()
+	}
+
+	if sc.Spec.AddProfileSnapshot != nil {
+		profileID := sc.Spec.AddProfileSnapshot.ProfileID
+		if len(profileID) > 253 || !selfConfigProfileIDPattern.MatchString(profileID) {
+			return nil, fmt.Errorf("spec.addProfileSnapshot.profileID %q must match ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ and be at most 253 characters", profileID)
+		}
 	}
 
 	if v.Client != nil {
@@ -93,4 +108,48 @@ func (v *HermesSelfConfigValidator) validate(ctx context.Context, obj runtime.Ob
 		}, nil
 	}
 	return nil, nil
+}
+
+func validateSelfConfigValueSources(sc *hermesv1.HermesSelfConfig) field.ErrorList {
+	errs := field.ErrorList{}
+	envPath := field.NewPath("spec", "addEnvVars")
+	for i, env := range sc.Spec.AddEnvVars {
+		itemPath := envPath.Index(i)
+		hasValue := env.Value != nil
+		hasValueFrom := env.ValueFrom != nil
+		if hasValue == hasValueFrom {
+			errs = append(errs, field.Invalid(
+				itemPath,
+				env.Name,
+				"set exactly one of value or valueFrom",
+			))
+		}
+		if env.ValueFrom != nil {
+			hasSecret := env.ValueFrom.SecretKeyRef != nil
+			hasConfigMap := env.ValueFrom.ConfigMapKeyRef != nil
+			if hasSecret == hasConfigMap {
+				errs = append(errs, field.Invalid(
+					itemPath.Child("valueFrom"),
+					env.Name,
+					"set exactly one of secretKeyRef or configMapKeyRef",
+				))
+			}
+		}
+	}
+
+	filePath := field.NewPath("spec", "addWorkspaceFiles")
+	for i, file := range sc.Spec.AddWorkspaceFiles {
+		itemPath := filePath.Index(i)
+		errs = append(errs, validateWorkspaceRelativePath(itemPath.Child("path"), file.Path, 512)...)
+		hasContent := file.Content != nil
+		hasContentFrom := file.ContentFrom != nil
+		if hasContent == hasContentFrom {
+			errs = append(errs, field.Invalid(
+				itemPath,
+				file.Path,
+				"set exactly one of content or contentFrom",
+			))
+		}
+	}
+	return errs
 }

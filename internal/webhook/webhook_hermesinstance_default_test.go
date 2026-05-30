@@ -51,6 +51,54 @@ func TestDefaulter_FillsNilFromClusterDefaults(t *testing.T) {
 	assert.Equal(t, "10Gi", inst.Spec.Storage.Persistence.Size)
 }
 
+func TestDefaulter_FillsPersistenceAndNetworkPolicyDefaults(t *testing.T) {
+	t.Parallel()
+	hcd := &hermesv1.HermesClusterDefaults{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+		Spec: hermesv1.HermesClusterDefaultsSpec{
+			Storage: hermesv1.StorageSpec{
+				Persistence: hermesv1.PersistenceSpec{Enabled: Ptr(false)},
+			},
+			Security: hermesv1.SecurityDefaults{
+				NetworkPolicy: hermesv1.NetworkPolicyDefaults{
+					Enabled:                   Ptr(false),
+					AllowDNS:                  Ptr(false),
+					AllowSameNamespaceIngress: Ptr(true),
+				},
+			},
+		},
+	}
+	inst := &hermesv1.HermesInstance{}
+
+	ApplyClusterDefaults(inst, hcd)
+
+	assert.False(t, *inst.Spec.Storage.Persistence.Enabled)
+	assert.False(t, *inst.Spec.Security.NetworkPolicy.Enabled)
+	assert.False(t, *inst.Spec.Security.NetworkPolicy.AllowDNS)
+	assert.True(t, *inst.Spec.Security.NetworkPolicy.AllowSameNamespaceIngress)
+}
+
+func TestDefaulter_UsesNetworkingNetworkPolicyDefaultsAsFallback(t *testing.T) {
+	t.Parallel()
+	hcd := &hermesv1.HermesClusterDefaults{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+		Spec: hermesv1.HermesClusterDefaultsSpec{
+			Networking: hermesv1.NetworkingDefaults{
+				NetworkPolicy: hermesv1.NetworkPolicyDefaults{
+					Enabled:  Ptr(false),
+					AllowDNS: Ptr(false),
+				},
+			},
+		},
+	}
+	inst := &hermesv1.HermesInstance{}
+
+	ApplyClusterDefaults(inst, hcd)
+
+	assert.False(t, *inst.Spec.Security.NetworkPolicy.Enabled)
+	assert.False(t, *inst.Spec.Security.NetworkPolicy.AllowDNS)
+}
+
 func TestDefaulter_ExplicitInstanceValuesAlwaysWin(t *testing.T) {
 	t.Parallel()
 	scheme := newScheme(t)

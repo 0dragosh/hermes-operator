@@ -1,7 +1,7 @@
 package resources
 
 import (
-	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -11,6 +11,16 @@ import (
 // MigrationSourceVolumeName is the volume name the migration init container
 // mounts as the OpenClaw source.
 const MigrationSourceVolumeName = "openclaw-source"
+
+const migrationFromS3Script = `set -euo pipefail
+mkdir -p /mnt/openclaw
+echo "Downloading OpenClaw snapshot ${OPENCLAW_S3_BUCKET}/${OPENCLAW_S3_KEY}" >&2
+aws --endpoint-url "$OPENCLAW_S3_ENDPOINT_URL" s3 cp "s3://${OPENCLAW_S3_BUCKET}/${OPENCLAW_S3_KEY}" - --no-progress \
+  | zstd -d \
+  | tar -xf - -C /mnt/openclaw
+echo "Running hermes-agent importer against extracted snapshot" >&2
+hermes-agent migrate from-openclaw --source /mnt/openclaw --dest /home/hermes/.hermes
+`
 
 // BuildMigrationInitContainer returns the init container that imports an
 // OpenClaw instance into the hermes PVC. Returns nil when migration is not
@@ -26,22 +36,13 @@ func BuildMigrationInitContainer(inst *hermesv1.HermesInstance) *corev1.Containe
 
 	image := fc.Image
 	if image == "" {
-		repo := inst.Spec.Image.Repository
-		if repo == "" {
-			repo = "ghcr.io/paperclipinc/hermes-agent"
-		}
-		tag := inst.Spec.Image.Tag
-		if tag == "" {
-			tag = "latest"
-		}
-		image = fmt.Sprintf("%s:%s", repo, tag)
+		image = imageRef(inst)
 	}
 
 	var (
-		args        []string
-		mounts      []corev1.VolumeMount
-		envFromList []corev1.EnvFromSource
-		envList     []corev1.EnvVar
+		args    []string
+		mounts  []corev1.VolumeMount
+		envList []corev1.EnvVar
 	)
 
 	switch {
@@ -62,22 +63,14 @@ hermes-agent migrate from-openclaw --source /mnt/openclaw --dest /home/hermes/.h
 		s3 := fc.Source.BackupRef.S3
 		args = []string{
 			"-c",
-			fmt.Sprintf(
-				`set -euo pipefail
-mkdir -p /mnt/openclaw
-echo "Downloading OpenClaw snapshot %s/%s" >&2
-aws --endpoint-url "https://%s" s3 cp "s3://%s/%s" - --no-progress | zstd -d | tar -xf - -C /mnt/openclaw
-echo "Running hermes-agent importer against extracted snapshot" >&2
-hermes-agent migrate from-openclaw --source /mnt/openclaw --dest /home/hermes/.hermes
-`,
-				s3.Bucket, s3.Key, s3.Endpoint, s3.Bucket, s3.Key,
-			),
+			migrationFromS3Script,
 		}
-		envFromList = []corev1.EnvFromSource{{
-			SecretRef: &corev1.SecretEnvSource{
-				LocalObjectReference: corev1.LocalObjectReference{Name: s3.CredentialsSecretRef.Name},
-			},
-		}}
+		envList = append(envList,
+			corev1.EnvVar{Name: "OPENCLAW_S3_BUCKET", Value: s3.Bucket},
+			corev1.EnvVar{Name: "OPENCLAW_S3_KEY", Value: s3.Key},
+			corev1.EnvVar{Name: "OPENCLAW_S3_ENDPOINT_URL", Value: normalizedEndpointURL(s3.Endpoint)},
+		)
+		envList = append(envList, s3CredentialKeyRefEnv(s3.CredentialsSecretRef.Name)...)
 		if s3.Region != "" {
 			envList = append(envList, corev1.EnvVar{Name: "AWS_DEFAULT_REGION", Value: s3.Region})
 		}
@@ -98,12 +91,18 @@ hermes-agent migrate from-openclaw --source /mnt/openclaw --dest /home/hermes/.h
 		TerminationMessagePath:   "/dev/termination-log",
 		TerminationMessagePolicy: corev1.TerminationMessageReadFile,
 		Env:                      envList,
-		EnvFrom:                  envFromList,
-		VolumeMounts:             mounts,
+		VolumeMounts:             append(mounts, corev1.VolumeMount{Name: "tmp", MountPath: "/tmp"}),
 		SecurityContext: &corev1.SecurityContext{
 			AllowPrivilegeEscalation: Ptr(false),
 			ReadOnlyRootFilesystem:   Ptr(true),
 			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 		},
 	}
+}
+
+func normalizedEndpointURL(endpoint string) string {
+	if strings.Contains(endpoint, "://") {
+		return endpoint
+	}
+	return "https://" + endpoint
 }

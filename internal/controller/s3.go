@@ -18,9 +18,6 @@ type S3Creds struct {
 	SecretAccessKey string
 }
 
-// ResticImage is the pinned default snapshot-tool image. Override via spec.backup.image.
-const ResticImage = "restic/restic:0.16.4"
-
 // ReadS3CredsFromSecret loads S3_ACCESS_KEY_ID + S3_SECRET_ACCESS_KEY from a Secret.
 func ReadS3CredsFromSecret(ctx context.Context, c client.Client, namespace, name string) (*S3Creds, error) {
 	secret := &corev1.Secret{}
@@ -59,17 +56,4 @@ func SnapshotKey(inst *hermesv1.HermesInstance, kind, timestamp string) string {
 		return fmt.Sprintf("%s%s/%s/failed/%s.tar.zst", prefix, inst.Namespace, inst.Name, timestamp)
 	}
 	return fmt.Sprintf("%s%s/%s/%s.tar.zst", prefix, inst.Namespace, inst.Name, timestamp)
-}
-
-// S3EnvVars returns the env vars that the restic container expects.
-func S3EnvVars(creds *S3Creds, s3 *hermesv1.BackupS3Spec) []corev1.EnvVar {
-	env := []corev1.EnvVar{
-		{Name: "AWS_ACCESS_KEY_ID", Value: creds.AccessKeyID},
-		{Name: "AWS_SECRET_ACCESS_KEY", Value: creds.SecretAccessKey},
-		{Name: "RESTIC_REPOSITORY", Value: fmt.Sprintf("s3:%s/%s", s3.Endpoint, s3.Bucket)},
-	}
-	if s3.Region != "" {
-		env = append(env, corev1.EnvVar{Name: "AWS_DEFAULT_REGION", Value: s3.Region})
-	}
-	return env
 }
