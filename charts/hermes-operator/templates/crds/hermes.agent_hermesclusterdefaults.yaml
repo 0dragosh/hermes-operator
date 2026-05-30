@@ -63,10 +63,11 @@ spec:
                     - Never
                     type: string
                   repository:
-                    default: ghcr.io/paperclipinc/hermes-agent
                     type: string
                   tag:
-                    default: latest
+                    description: |-
+                      Tag must be a concrete tag and must not be "latest" unless the image
+                      repository is pinned by digest.
                     type: string
                 type: object
               networking:
@@ -77,6 +78,8 @@ spec:
                       NetworkPolicies are created.
                     properties:
                       allowDNS:
+                        type: boolean
+                      allowSameNamespaceIngress:
                         type: boolean
                       enabled:
                         type: boolean
@@ -135,7 +138,7 @@ spec:
                         minimum: 1
                         type: integer
                       secure:
-                        default: false
+                        default: true
                         description: |-
                           Secure: when true, /metrics requires bearer-token auth and uses HTTPS.
                           The ServiceMonitor scheme/scrape settings must agree (lesson #435/#440).
@@ -269,6 +272,8 @@ spec:
                       NetworkPolicies are created.
                     properties:
                       allowDNS:
+                        type: boolean
+                      allowSameNamespaceIngress:
                         type: boolean
                       enabled:
                         type: boolean

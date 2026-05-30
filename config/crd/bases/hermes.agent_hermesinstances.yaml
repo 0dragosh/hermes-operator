@@ -507,6 +507,9 @@ spec:
                       target.
                     properties:
                       bucket:
+                        maxLength: 63
+                        minLength: 3
+                        pattern: ^[a-z0-9][a-z0-9.-]*[a-z0-9]$
                         type: string
                       credentialsSecretRef:
                         description: LocalObjectReference is a same-namespace reference
@@ -518,8 +521,13 @@ spec:
                         - name
                         type: object
                       endpoint:
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^[^[:space:][:cntrl:]]+$
                         type: string
                       pathPrefix:
+                        maxLength: 1024
+                        pattern: ^$|^[^[:cntrl:]]+$
                         type: string
                       region:
                         type: string
@@ -3024,10 +3032,11 @@ spec:
                     - Never
                     type: string
                   repository:
-                    default: ghcr.io/paperclipinc/hermes-agent
                     type: string
                   tag:
-                    default: latest
+                    description: |-
+                      Tag must be a concrete tag and must not be "latest" unless the image
+                      repository is pinned by digest.
                     type: string
                 type: object
               initContainers:
@@ -4582,6 +4591,9 @@ spec:
                                   but adds an explicit Key.
                                 properties:
                                   bucket:
+                                    maxLength: 63
+                                    minLength: 3
+                                    pattern: ^[a-z0-9][a-z0-9.-]*[a-z0-9]$
                                     type: string
                                   credentialsSecretRef:
                                     description: LocalObjectReference is a same-namespace
@@ -4593,8 +4605,14 @@ spec:
                                     - name
                                     type: object
                                   endpoint:
+                                    maxLength: 253
+                                    minLength: 1
+                                    pattern: ^[^[:space:][:cntrl:]]+$
                                     type: string
                                   key:
+                                    maxLength: 1024
+                                    minLength: 1
+                                    pattern: ^[^[:cntrl:]]+$
                                     type: string
                                   region:
                                     type: string
@@ -4620,6 +4638,9 @@ spec:
                             - namespace
                             type: object
                         type: object
+                        x-kubernetes-validations:
+                        - message: set exactly one of openclawInstanceRef or backupRef
+                          rule: has(self.openclawInstanceRef) != has(self.backupRef)
                     required:
                     - source
                     type: object
@@ -4808,7 +4829,7 @@ spec:
                         minimum: 1
                         type: integer
                       secure:
-                        default: false
+                        default: true
                         description: |-
                           Secure: when true, /metrics requires bearer-token auth and uses HTTPS.
                           The ServiceMonitor scheme/scrape settings must agree (lesson #435/#440).
@@ -5508,10 +5529,10 @@ spec:
                 properties:
                   extraAptPackages:
                     description: |-
-                      ExtraAptPackages adds additional Debian packages installed by a
-                      root-privileged init container BEFORE the main agent container starts.
-                      Use sparingly: the init container runs as root and breaks the otherwise
-                      hardened security posture for one container only.
+                      ExtraAptPackages is retained for API compatibility only. Non-empty values
+                      are rejected because init-container package installs do not affect the
+                      main container filesystem. Build a custom agent image with OS packages
+                      already installed instead.
                     items:
                       type: string
                     type: array
@@ -7000,13 +7021,20 @@ spec:
                         default: true
                         description: |-
                           AllowDNS: emit the standard DNS egress rule (UDP+TCP 53 to any peer).
-                          Default true. Disable only when CoreDNS is reachable via a different
-                          transport (e.g. node-local DNS via hostNetwork).
+                          Kubernetes NetworkPolicy cannot portably target CoreDNS without
+                          cluster-specific selectors. Strict installs can set this false and supply
+                          DNS egress through AdditionalEgress.
+                        type: boolean
+                      allowSameNamespaceIngress:
+                        default: false
+                        description: |-
+                          AllowSameNamespaceIngress allows pods from the instance namespace to
+                          connect to the agent's exposed ports.
                         type: boolean
                       allowedEgressCIDRs:
                         description: |-
-                          AllowedEgressCIDRs is the set of CIDRs the agent may connect to in addition
-                          to the operator-built defaults (DNS + 443).
+                          AllowedEgressCIDRs is the set of CIDRs the agent may connect to in
+                          addition to operator-built DNS egress.
                         items:
                           type: string
                         type: array
@@ -7021,8 +7049,8 @@ spec:
                         x-kubernetes-list-type: set
                       allowedIngressNamespaces:
                         description: |-
-                          AllowedIngressNamespaces is the set of additional namespaces (beyond the
-                          instance's own) whose pods may connect to the agent's exposed ports.
+                          AllowedIngressNamespaces is the set of namespaces whose pods may connect
+                          to the agent's exposed ports.
                         items:
                           type: string
                         type: array
@@ -7031,8 +7059,9 @@ spec:
                         default: true
                         description: |-
                           Enabled: when true (the default), the operator creates a deny-all
-                          NetworkPolicy plus selective allow rules (DNS + 443 egress + Service ingress
-                          from the same namespace).
+                          NetworkPolicy plus selective allow rules. By default this only emits DNS
+                          egress; ingress sources and non-DNS egress destinations must be configured
+                          explicitly.
                         type: boolean
                     type: object
                   podSecurityContext:
@@ -7333,8 +7362,8 @@ spec:
                 type: object
               sidecars:
                 description: |-
-                  Sidecars is a user-supplied list of sidecars appended after operator-managed
-                  sidecars (e.g. ollama / web-terminal / tailscale from Plan 3).
+                  Sidecars is a user-supplied list of sidecars appended after
+                  operator-managed sidecars.
                 items:
                   description: A single application container that you want to run
                     within a pod.
@@ -8944,9 +8973,8 @@ spec:
                       SSA list-map key is "path" so HermesSelfConfig (Plan 4) can patch entries
                       in place without replacing the whole slice.
                     items:
-                      description: |-
-                        WorkspaceFile is a single seeded file. Nested paths are allowed; the workspace
-                        ConfigMap encodes them with "__" separators (decoded by runtime-init).
+                      description: WorkspaceFile is a single seeded file. Nested paths
+                        are allowed.
                       properties:
                         content:
                           description: |-
@@ -8959,7 +8987,7 @@ spec:
                             "notes/finance/2026.md").
                           maxLength: 4096
                           minLength: 1
-                          pattern: ^[^/].*[^/]$|^[^/]$
+                          pattern: ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$
                           type: string
                       required:
                       - content

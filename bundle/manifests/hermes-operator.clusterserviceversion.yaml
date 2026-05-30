@@ -1,27 +1,25 @@
 apiVersion: operators.coreos.com/v1alpha1
 kind: ClusterServiceVersion
 metadata:
-  name: 0.1.8
+  name: hermes-operator.v0.1.8
   namespace: placeholder
   annotations:
     capabilities: Auto Pilot
     categories: AI/Machine Learning, Developer Tools, Application Runtime
-    containerImage: 0.1.8
+    containerImage: ghcr.io/paperclipinc/hermes-operator:v0.1.8
     createdAt: '2026-05-12T00:00:00Z'
     support: paperclipinc
     repository: https://github.com/paperclipinc/hermes-operator
     description: >-
-      A production-grade Kubernetes operator for deploying and managing
-      nousresearch/hermes-agent: a Python-based self-improving multi-platform AI
-      agent.
-    alm-examples: |-
+      A production-grade Kubernetes operator for deploying and managing nousresearch/hermes-agent: a Python-based self-improving multi-platform AI agent.
+    alm-examples: |
       [
         {
           "apiVersion": "hermes.agent/v1",
           "kind": "HermesInstance",
           "metadata": { "name": "demo", "namespace": "default" },
           "spec": {
-            "image": { "repository": "ghcr.io/paperclipinc/hermes-agent", "tag": "1.0.0" },
+            "image": { "repository": "ghcr.io/paperclipinc/hermes-agent", "tag": "v2026.5.29.2" },
             "storage": { "persistence": { "enabled": true, "size": "10Gi" } },
             "envFrom": [{ "secretRef": { "name": "hermes-api-keys" } }]
           }
@@ -31,20 +29,33 @@ metadata:
           "kind": "HermesInstance",
           "metadata": { "name": "production", "namespace": "hermes" },
           "spec": {
-            "image": { "repository": "ghcr.io/paperclipinc/hermes-agent", "tag": "1.0.0" },
+            "image": { "repository": "ghcr.io/paperclipinc/hermes-agent", "tag": "v2026.5.29.2" },
             "resources": {
               "requests": { "cpu": "500m", "memory": "1Gi" },
-              "limits":   { "cpu": "2",    "memory": "4Gi" }
+              "limits": { "cpu": "2", "memory": "4Gi" }
             },
             "storage": { "persistence": { "enabled": true, "size": "50Gi" } },
             "gateways": {
-              "telegram": { "enabled": true, "tokenSecretRef": { "name": "tg-token" } },
-              "slack":    { "enabled": true, "tokenSecretRef": { "name": "slack-token" } }
+              "telegram": { "enabled": true, "botTokenSecretRef": { "name": "tg-token", "key": "token" } },
+              "slack": {
+                "enabled": true,
+                "botTokenSecretRef": { "name": "slack-bot-token", "key": "token" },
+                "appTokenSecretRef": { "name": "slack-app-token", "key": "token" },
+                "signingSecretRef": { "name": "slack-signing-secret", "key": "secret" }
+              }
             },
-            "profileStore": { "enabled": true, "persistence": { "size": "5Gi" } },
+            "profileStore": {
+              "honcho": {
+                "enabled": true,
+                "image": { "repository": "ghcr.io/plastic-labs/honcho", "tag": "0.1.0" },
+                "persistence": { "enabled": true, "size": "5Gi" },
+                "apiKeySecretRef": { "name": "hermes-honcho", "key": "apiKey" }
+              }
+            },
             "selfConfigure": {
               "enabled": true,
-              "protectedKeys": ["image", "storage", "security", "networking"]
+              "allowedActions": ["skills", "config", "envVars", "workspaceFiles", "profiles"],
+              "protectedKeys": ["spec.image.*", "spec.storage.*", "spec.security.*", "spec.networking.*"]
             },
             "observability": { "serviceMonitor": { "enabled": true } },
             "backup": {
@@ -60,7 +71,7 @@ metadata:
             },
             "autoUpdate": {
               "enabled": true,
-              "source": { "registry": "ghcr.io/paperclipinc/hermes-agent", "channel": "1.x" },
+              "source": { "registry": "ghcr.io/paperclipinc/hermes-agent", "channel": "v2026.5" },
               "rollback": { "enabled": true, "probeFailureThreshold": 3 }
             }
           }
@@ -81,8 +92,8 @@ metadata:
           "kind": "HermesClusterDefaults",
           "metadata": { "name": "cluster" },
           "spec": {
-            "image": { "repository": "ghcr.io/paperclipinc/hermes-agent", "tag": "1.0.0" },
-            "storage": { "storageClassName": "gp3", "size": "10Gi" },
+            "image": { "repository": "ghcr.io/paperclipinc/hermes-agent", "tag": "v2026.5.29.2" },
+            "storage": { "persistence": { "storageClassName": "gp3", "size": "10Gi" } },
             "observability": { "serviceMonitor": { "enabled": true } },
             "networking": { "networkPolicy": { "enabled": true } }
           }
@@ -115,8 +126,7 @@ spec:
 
     WhatsApp, Signal), self-improves through a built-in learning loop, persists
 
-    session memory via FTS5, models users via Honcho dialectic profiles, and
-    runs
+    session memory via FTS5, models users via Honcho dialectic profiles, and runs
 
     scheduled automations via a native cron scheduler.
 
@@ -125,23 +135,127 @@ spec:
 
 
     - **Declarative Deployment**: every aspect of an agent's runtime, gateways,
+
+
+
+
+
+
+
+
+
+
+
+
+
       storage, networking, observability, and security through a single
       `HermesInstance` resource.
     - **Self-Configuration with Audit**: the agent persists learned skills, env
+
+
+
+
+
+
+
+
+
+
+
+
+
       vars, config patches, and workspace files via `HermesSelfConfig` CRs that
       the operator validates against an explicit allowlist, then applies via
       Server-Side Apply (no GitOps flap).
     - **Cluster Defaults**: `HermesClusterDefaults` (cluster-scoped singleton)
+
+
+
+
+
+
+
+
+
+
+
+
+
       supplies organization-wide defaults for image, storage class, IRSA, etc.
     - **Auto-Update with Rollback**: OCI registry polling with pre-update backup
+
+
+
+
+
+
+
+
+
+
+
+
+
       and probe-driven rollback.
     - **Backup / Restore**: S3-compatible (R2, MinIO, AWS), backup-on-delete
+
+
+
+
+
+
+
+
+
+
+
+
+
       finalizer, declarative restore from snapshot.
     - **OpenClaw Migration**: one-shot `spec.migration.fromOpenClaw` invokes
+
+
+
+
+
+
+
+
+
+
+
+
+
       hermes-agent's built-in importer.
     - **Honcho Profile Store**: optional companion Deployment with persistence
+
+
+
+
+
+
+
+
+
+
+
+
+
       for dialectic user profiles.
     - **Multi-Platform Gateways**: first-class config for Telegram, Discord,
+
+
+
+
+
+
+
+
+
+
+
+
+
       Slack, WhatsApp, Signal: each with isolated secret rotation.
 
     ### Default Security Posture
@@ -186,12 +300,26 @@ spec:
     3. Create a `HermesInstance` referencing the Secret.
 
     4. The operator handles the rest: deployment, networking, security,
+
+
+
+
+
+
+
+
+
+
+
+
+
        lifecycle.
 
     ### Prerequisites
 
 
     - Kubernetes 1.28+
+
   maturity: alpha
   version: 0.1.8
   minKubeVersion: 1.28.0
@@ -237,9 +365,11 @@ spec:
       supported: true
   relatedImages:
     - name: hermes-operator
-      image: ghcr.io/paperclipinc/hermes-operator:v0.1.0
+      image: ghcr.io/paperclipinc/hermes-operator:v0.1.8
     - name: hermes-agent
-      image: ghcr.io/paperclipinc/hermes-agent:latest
+      image: ghcr.io/paperclipinc/hermes-agent:v2026.5.29.2
+    - name: honcho
+      image: ghcr.io/plastic-labs/honcho:0.1.0
   customresourcedefinitions:
     owned:
       - name: hermesinstances.hermes.agent
@@ -247,8 +377,7 @@ spec:
         kind: HermesInstance
         displayName: Hermes Instance
         description: >-
-          Represents a managed hermes-agent instance with security, networking,
-          gateways, storage, and observability.
+          Represents a managed hermes-agent instance with security, networking, gateways, storage, and observability.
         specDescriptors:
           - path: image.repository
             displayName: Image Repository
@@ -290,7 +419,7 @@ spec:
             displayName: Signal Gateway
             x-descriptors:
               - urn:alm:descriptor:com.tectonic.ui:booleanSwitch
-          - path: profileStore.enabled
+          - path: profileStore.honcho.enabled
             displayName: Honcho Profile Store
             x-descriptors:
               - urn:alm:descriptor:com.tectonic.ui:booleanSwitch
@@ -383,8 +512,7 @@ spec:
         kind: HermesSelfConfig
         displayName: Hermes SelfConfig
         description: >-
-          Agent-initiated mutation request, validated against the parent
-          instance's selfConfigure policy and applied via Server-Side Apply.
+          Agent-initiated mutation request, validated against the parent instance's selfConfigure policy and applied via Server-Side Apply.
         specDescriptors:
           - path: instanceRef
             displayName: Instance Reference
@@ -416,14 +544,13 @@ spec:
         kind: HermesClusterDefaults
         displayName: Hermes Cluster Defaults
         description: >-
-          Cluster-scoped singleton that fills nil fields on every
-          HermesInstance. Name must be 'cluster'.
+          Cluster-scoped singleton that fills nil fields on every HermesInstance. Name must be 'cluster'.
         specDescriptors:
           - path: image.repository
             displayName: Default Image Repository
             x-descriptors:
               - urn:alm:descriptor:com.tectonic.ui:text
-          - path: storage.storageClassName
+          - path: storage.persistence.storageClassName
             displayName: Default StorageClass
             x-descriptors:
               - urn:alm:descriptor:com.tectonic.ui:text
@@ -439,7 +566,7 @@ spec:
         - serviceAccountName: hermes-operator-controller-manager
           rules:
             - apiGroups:
-                - ''
+                - ""
               resources:
                 - configmaps
                 - events
@@ -456,7 +583,7 @@ spec:
                 - update
                 - watch
             - apiGroups:
-                - ''
+                - ""
               resources:
                 - pods
               verbs:
@@ -622,12 +749,14 @@ spec:
                 terminationGracePeriodSeconds: 10
                 containers:
                   - name: manager
-                    image: ghcr.io/paperclipinc/hermes-operator:v0.1.0
+                    image: ghcr.io/paperclipinc/hermes-operator:v0.1.8
                     command:
                       - /manager
                     args:
-                      - '--leader-elect'
-                      - '--health-probe-bind-address=:8081'
+                      - --leader-elect
+                      - --health-probe-bind-address=:8081
+                      - --metrics-bind-address=:8443
+                      - --metrics-secure=true
                     securityContext:
                       allowPrivilegeEscalation: false
                       capabilities:
@@ -654,3 +783,91 @@ spec:
                       requests:
                         cpu: 100m
                         memory: 128Mi
+                    ports:
+                      - name: metrics
+                        containerPort: 8443
+                        protocol: TCP
+                      - name: webhook
+                        containerPort: 9443
+                        protocol: TCP
+      webhookdefinitions:
+        - type: MutatingAdmissionWebhook
+          admissionReviewVersions:
+            - v1
+          containerPort: 9443
+          targetPort: 9443
+          deploymentName: hermes-operator-controller-manager
+          failurePolicy: Fail
+          generateName: mhermesinstance.hermes.agent
+          sideEffects: None
+          webhookPath: /mutate-hermes-agent-v1-hermesinstance
+          rules:
+            - apiGroups:
+                - hermes.agent
+              apiVersions:
+                - v1
+              operations:
+                - CREATE
+                - UPDATE
+              resources:
+                - hermesinstances
+        - type: ValidatingAdmissionWebhook
+          admissionReviewVersions:
+            - v1
+          containerPort: 9443
+          targetPort: 9443
+          deploymentName: hermes-operator-controller-manager
+          failurePolicy: Fail
+          generateName: vhermesinstance.hermes.agent
+          sideEffects: None
+          webhookPath: /validate-hermes-agent-v1-hermesinstance
+          rules:
+            - apiGroups:
+                - hermes.agent
+              apiVersions:
+                - v1
+              operations:
+                - CREATE
+                - UPDATE
+              resources:
+                - hermesinstances
+        - type: ValidatingAdmissionWebhook
+          admissionReviewVersions:
+            - v1
+          containerPort: 9443
+          targetPort: 9443
+          deploymentName: hermes-operator-controller-manager
+          failurePolicy: Fail
+          generateName: vhermesclusterdefaults.hermes.agent
+          sideEffects: None
+          webhookPath: /validate-hermes-agent-v1-hermesclusterdefaults
+          rules:
+            - apiGroups:
+                - hermes.agent
+              apiVersions:
+                - v1
+              operations:
+                - CREATE
+                - UPDATE
+              resources:
+                - hermesclusterdefaults
+        - type: ValidatingAdmissionWebhook
+          admissionReviewVersions:
+            - v1
+          containerPort: 9443
+          targetPort: 9443
+          deploymentName: hermes-operator-controller-manager
+          failurePolicy: Fail
+          generateName: vhermesselfconfig.hermes.agent
+          sideEffects: None
+          webhookPath: /validate-hermes-agent-v1-hermesselfconfig
+          rules:
+            - apiGroups:
+                - hermes.agent
+              apiVersions:
+                - v1
+              operations:
+                - CREATE
+                - UPDATE
+              resources:
+                - hermesselfconfigs

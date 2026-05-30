@@ -6,6 +6,7 @@ logLevel: info
 createRBAC: true
 watchNamespaces: []
 metrics:
+  enabled: true
   secure: true
 resources:
   requests:
@@ -25,7 +26,7 @@ webhook:
   servingCertSecretName: hermes-operator-webhook-server-cert
 agentImage:
   repository: ghcr.io/paperclipinc/hermes-agent
-  tag: v0.13.0
+  tag: v2026.5.29.2
   pullPolicy: IfNotPresent
 honchoImage:
   repository: ghcr.io/plastic-labs/honcho

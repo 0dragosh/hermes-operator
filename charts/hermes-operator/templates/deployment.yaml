@@ -23,6 +23,13 @@ spec:
           image: {{ include "hermes-operator.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
+            - --leader-elect
+            - --health-probe-bind-address=:8081
+            {{- if .Values.metrics.enabled }}
+            - --metrics-bind-address=:8443
+            {{- else }}
+            - --metrics-bind-address=0
+            {{- end }}
             - --metrics-secure={{ .Values.metrics.secure }}
             - --zap-log-level={{ .Values.logLevel }}
             {{- with .Values.watchNamespaces }}
@@ -38,14 +45,28 @@ spec:
             readOnlyRootFilesystem: true
             capabilities: { drop: [ALL] }
           ports:
+            {{- if .Values.metrics.enabled }}
             - name: metrics
               containerPort: 8443
               protocol: TCP
+            {{- end }}
             {{- if .Values.webhook.enabled }}
             - name: webhook
               containerPort: {{ .Values.webhook.port }}
               protocol: TCP
             {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
           {{- if .Values.webhook.enabled }}
           volumeMounts:
             - name: webhook-cert

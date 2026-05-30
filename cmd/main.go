@@ -197,6 +197,7 @@ func main() {
 
 	if err := (&controller.HermesInstanceReconciler{
 		Client:                        mgr.GetClient(),
+		APIReader:                     mgr.GetAPIReader(),
 		Scheme:                        mgr.GetScheme(),
 		Recorder:                      mgr.GetEventRecorderFor("hermesinstance"),
 		PrometheusOperatorCRDsPresent: hasPromOpCRDs,
