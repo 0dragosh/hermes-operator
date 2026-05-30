@@ -6,20 +6,18 @@ spec:
   image:
     repository: ghcr.io/paperclipinc/hermes-agent
     tag: "1.4.2"
-    imagePullSecrets:
-      - name: ghcr-pull
   registry:
     pullSecretName: ghcr-pull
   storage:
-    storageClassName: gp3
-    size: 10Gi
+    persistence:
+      storageClassName: gp3
+      size: 10Gi
   security:
     serviceAccount:
       annotations:
         eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/hermes
+    networkPolicy:
+      enabled: true
   observability:
     serviceMonitor:
-      enabled: true
-  networking:
-    networkPolicy:
       enabled: true

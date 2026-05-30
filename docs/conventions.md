@@ -113,9 +113,9 @@ Plan 1 listed StatefulSet / Service / Probe defaults. Plan 2 adds these:
 | PodDisruptionBudget | one of `MinAvailable` / `MaxUnavailable` | when neither set, `MaxUnavailable: 1` |
 | Role | `apiGroups` | empty string `""` for core resources, explicit other groups |
 
-## Well-known egress endpoints
+## Gateway egress endpoints
 
-The operator's default-deny `NetworkPolicy` allows only DNS to kube-dns out of the box. Each `spec.gateways.<platform>.enabled: true` adds an egress allow for the upstream's well-known endpoints. CNI plugins that support FQDN peers (Cilium, Calico with `dns` selector) should match the hostnames below; plugins without FQDN support fall back to a port-only rule (443/TCP to any destination), which is wider than ideal: document the trade-off when shipping the cluster.
+The operator's default-deny `NetworkPolicy` allows only DNS out of the box when `spec.security.networkPolicy.allowDNS` is true. Gateway enablement does not add internet egress rules, because Kubernetes NetworkPolicy cannot portably target FQDN peers and the operator must not widen the policy with an empty-peer 443/TCP rule. Users must configure gateway upstream access explicitly with `spec.security.networkPolicy.allowedEgressCIDRs`, `spec.security.networkPolicy.additionalEgress`, or a CNI-specific FQDN policy outside the portable API.
 
 | Gateway | Hostnames | Port | Protocol | Notes |
 |---|---|---|---|---|
@@ -123,7 +123,7 @@ The operator's default-deny `NetworkPolicy` allows only DNS to kube-dns out of t
 | Discord | `discord.com`, `gateway.discord.gg` | 443 | TCP | gateway.discord.gg is the WebSocket endpoint. |
 | Slack | `slack.com`, `wss-primary.slack.com` | 443 | TCP | wss-primary.slack.com is the Socket Mode endpoint. |
 | WhatsApp (Meta Cloud) | `graph.facebook.com` | 443 | TCP | Provider-specific. Twilio users should replace with `api.twilio.com`. |
-| Signal (chat.signal.org) | `chat.signal.org` | 443 | TCP | Self-hosted signal-cli-rest-api deployments should supplement via `spec.networking.egress`. |
-| Honcho (sibling) | sibling pod selector | 8000 | TCP | In-namespace pod-selector peer, not internet. |
+| Signal (chat.signal.org) | `chat.signal.org` | 443 | TCP | Self-hosted signal-cli-rest-api deployments should supplement via `spec.security.networkPolicy.additionalEgress`. |
+| Honcho (sibling) | sibling pod selector | 8000 | TCP | The operator emits this in-namespace pod-selector rule when `spec.profileStore.honcho.enabled=true`; it is not internet egress. |
 
 The operator does NOT cover ingress from those providers (Telegram, Slack webhook callbacks, etc.): surface that via `spec.networking.ingress` or a dedicated Ingress object in your cluster.

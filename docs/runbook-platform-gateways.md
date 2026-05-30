@@ -278,8 +278,8 @@ spec:
 
 - **Phone number re-registration**: Re-registering a Signal number invalidates all existing sessions. Do this only intentionally and expect a brief messaging outage.
 - **Self-hosted latency**: signal-cli-rest-api has higher message latency than the native Signal protocol. For low-latency requirements, consider co-locating it with the agent.
-- **NetworkPolicy egress**: The operator's generated NetworkPolicy adds `chat.signal.org:443` to the allowed egress. If you use a self-hosted signal-cli-rest-api in a different namespace, also add an egress rule for its Service via `spec.security.networkPolicy.additionalEgress`.
-- **No FQDN peer support**: On CNIs without FQDN peer support, the `chat.signal.org` rule degrades to port-443 to any destination. See `docs/conventions.md`: Well-known egress endpoints.
+- **NetworkPolicy egress**: The operator's generated NetworkPolicy does not add gateway FQDN egress because Kubernetes NetworkPolicy cannot portably target hostnames. Configure `spec.security.networkPolicy.allowedEgressCIDRs` or `spec.security.networkPolicy.additionalEgress` for `chat.signal.org:443` or for a self-hosted signal-cli-rest-api Service.
+- **DNS egress**: The generated NetworkPolicy keeps DNS egress enabled by default with UDP/TCP port 53 to any peer. Strict installs can set `spec.security.networkPolicy.allowDNS=false` and supply cluster-specific DNS egress through `additionalEgress`.
 
 ---
 

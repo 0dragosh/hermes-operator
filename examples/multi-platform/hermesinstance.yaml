@@ -13,33 +13,35 @@ spec:
   gateways:
     telegram:
       enabled: true
-      secretRef:
+      botTokenSecretRef:
         name: hermes-telegram
-        tokenKey: token
+        key: token
     discord:
       enabled: true
-      secretRef:
+      botTokenSecretRef:
         name: hermes-discord
-        tokenKey: token
+        key: token
     slack:
       enabled: true
-      secretRef:
+      botTokenSecretRef:
         name: hermes-slack
-        botTokenKey: botToken
-        signingSecretKey: signingSecret
-      ingress:
-        enabled: true
-        host: hermes-slack.example.com
-        # Slack's events webhook requires a public HTTPS endpoint.
-        # Bring your own ingress controller + TLS.
+        key: botToken
+      appTokenSecretRef:
+        name: hermes-slack
+        key: appToken
+      signingSecretRef:
+        name: hermes-slack
+        key: signingSecret
     whatsapp:
       enabled: true
-      secretRef:
+      providerSecretRef:
         name: hermes-whatsapp
-        accessTokenKey: accessToken
-        phoneNumberIDKey: phoneNumberID
+        key: provider
     signal:
       enabled: true
-      secretRef:
+      phoneNumberSecretRef:
         name: hermes-signal
-        registrationKeyKey: registrationKey
+        key: phoneNumber
+      authTokenSecretRef:
+        name: hermes-signal
+        key: authToken

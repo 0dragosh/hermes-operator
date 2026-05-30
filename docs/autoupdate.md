@@ -45,24 +45,26 @@ poll → list tags → HighestMatching(channel) → compare to currentRunningTag
   └─ newer tag T:
         ├─ if T == status.autoUpdate.lastFailedTag → skip, reason=SuppressedKnownFailure
         ├─ take pre-update backup (BackupReconciler.RunOneShot)
-        ├─ patch StatefulSet container[0].image (NOT spec.image.tag)
         ├─ annotate `hermes.agent/autoupdate-target=T`
         ├─ set status.autoUpdate.targetTag = T, rolloutDeadline = now+5m
+        ├─ main HermesInstance reconcile updates StatefulSet from status
         └─ watch readiness for 5m
               ├─ ReadyReplicas==1, UpdatedReplicas==1 → success: lastSuccessTag=T, condition=Confirmed
               └─ ProbeFailures >= threshold OR past deadline → rollback:
-                    ├─ patch STS container[0].image = lastSuccessTag
+                    ├─ status.autoUpdate.currentTag = lastSuccessTag
                     ├─ status.autoUpdate.lastFailedTag = T
+                    ├─ clear status.autoUpdate.targetTag
+                    ├─ main HermesInstance reconcile updates StatefulSet from status
                     └─ ConditionAutoUpdateRolledBack=True, reason=RolledBackFrom_T
 ```
 
 ## Why `spec.image.tag` is not patched
 
-The operator deliberately rolls the StatefulSet PodTemplate forward instead of patching `spec.image.tag`. Reasons:
+The operator deliberately records rollout intent in `status.autoUpdate` instead of patching `spec.image.tag`. The main `HermesInstance` reconcile then renders the StatefulSet PodTemplate from that status. Reasons:
 
-1. **GitOps coexistence.** `spec.image.tag` is what the user sees in Git. If the operator patched it, FluxCD/Argo would either revert the change (causing thrash) or accept it (causing Git/cluster drift). Neither is acceptable. By rolling the STS PodTemplate, the operator owns the "in-flight target" view while the user owns the "intended" view via `spec.image.tag`.
+1. **GitOps coexistence.** `spec.image.tag` is what the user sees in Git. If the operator patched it, FluxCD/Argo would either revert the change (causing thrash) or accept it (causing Git/cluster drift). Neither is acceptable. By rendering the StatefulSet PodTemplate from status, the operator owns the "in-flight target" view while the user owns the "intended" view via `spec.image.tag`.
 2. **Drift is observable.** `status.autoUpdate.currentTag` reports the actual running tag; `spec.image.tag` reports the intended floor. A discrepancy is a signal, not a bug.
-3. **Rollback is local.** A rollback only mutates the STS PodTemplate: no cross-resource ordering, no need to wait for the user to update Git.
+3. **Rollback is local.** A rollback only mutates auto-update status; the main reconciler converges the StatefulSet from that status without changing Git-owned spec.
 
 To "promote" a confirmed auto-update tag into the spec, the user updates `spec.image.tag` in Git and commits. The operator will observe that `currentRunningTag` already matches and no-op.
 
@@ -74,7 +76,7 @@ This is intentional: pulling a 1000-tag list on every reconcile is rude. In prod
 
 ## Rollback semantics
 
-A rollback is a controller-driven STS image revert plus a `LastFailedTag` record. The controller will not retry the same tag automatically. To force a retry (e.g. after fixing a regression in the registry):
+A rollback records the previous known-good tag in `status.autoUpdate.currentTag`, clears the in-flight target, and records `lastFailedTag`. The controller will not retry the same tag automatically. To force a retry (e.g. after fixing a regression in the registry):
 
 ```bash
 kubectl patch hermesinstance my-hermes --subresource=status --type=merge -p '{"status":{"autoUpdate":{"lastFailedTag":""}}}'

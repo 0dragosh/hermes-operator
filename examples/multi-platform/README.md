@@ -36,8 +36,9 @@ the offending gateways.
 
 ## Rotating a token
 
-Update the Secret in place (each `secretRef` watches its Secret via the
-informer cache):
+Update the Secret in place. Each gateway selector, such as
+`botTokenSecretRef`, `appTokenSecretRef`, or `signingSecretRef`, watches
+its Secret via the informer cache:
 
 ```bash
 kubectl create secret generic hermes-slack \

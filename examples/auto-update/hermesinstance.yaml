@@ -28,5 +28,4 @@ spec:
     rollback:
       enabled: true
       probeFailureThreshold: 3
-      deadlineMinutes: 5
     backupBeforeUpdate: true

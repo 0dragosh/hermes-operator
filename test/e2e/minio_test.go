@@ -8,17 +8,11 @@ import (
 )
 
 const minioManifest = `
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: minio
----
 apiVersion: v1
 kind: Secret
 metadata:
   name: minio-root
-  namespace: minio
+  namespace: {{ .MinIONamespace }}
 type: Opaque
 stringData:
   rootUser: minioadmin
@@ -28,7 +22,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: minio
-  namespace: minio
+  namespace: {{ .MinIONamespace }}
 spec:
   replicas: 1
   selector: { matchLabels: { app: minio } }
@@ -57,7 +51,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: minio
-  namespace: minio
+  namespace: {{ .MinIONamespace }}
 spec:
   selector: { app: minio }
   ports:
@@ -72,7 +66,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: mc-mkbucket
-  namespace: minio
+  namespace: {{ .MinIONamespace }}
 spec:
   backoffLimit: 6
   template:
@@ -95,17 +89,20 @@ spec:
 `
 
 // InstallMinIO deploys MinIO + creates a bucket. Idempotent.
-func InstallMinIO() {
-	out, err := runStdin("kubectl", []string{"apply", "-f", "-"}, minioManifest)
+func InstallMinIO(cfg e2eConfig) {
+	manifest, err := renderE2ETemplate(minioManifest, cfg)
+	Expect(err).NotTo(HaveOccurred(), "render MinIO manifest")
+
+	out, err := runStdin("kubectl", []string{"apply", "-f", "-"}, manifest)
 	Expect(err).ToNot(HaveOccurred(), "kubectl apply failed: %s", out)
 
 	Eventually(func() string {
-		out, _ := kubectl("get", "deploy/minio", "-n", "minio", "-o", "jsonpath={.status.readyReplicas}")
+		out, _ := kubectl("get", "deploy/minio", "-n", cfg.MinIONamespace, "-o", "jsonpath={.status.readyReplicas}")
 		return strings.TrimSpace(out)
 	}).Should(Equal("1"))
 
 	Eventually(func() string {
-		out, _ := kubectl("get", "job/mc-mkbucket", "-n", "minio", "-o", "jsonpath={.status.succeeded}")
+		out, _ := kubectl("get", "job/mc-mkbucket", "-n", cfg.MinIONamespace, "-o", "jsonpath={.status.succeeded}")
 		return strings.TrimSpace(out)
 	}).Should(Equal("1"))
 }

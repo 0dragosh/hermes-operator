@@ -14,8 +14,8 @@ kubectl create namespace agents
 
 kubectl create secret generic hermes-s3-creds \
   -n agents \
-  --from-literal=accessKey=REPLACE \
-  --from-literal=secretKey=REPLACE
+  --from-literal=S3_ACCESS_KEY_ID=REPLACE \
+  --from-literal=S3_SECRET_ACCESS_KEY=REPLACE
 ```
 
 A reachable S3 bucket is required because `backupBeforeUpdate: true`

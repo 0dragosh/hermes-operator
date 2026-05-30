@@ -7,11 +7,12 @@ instance always win: `HermesClusterDefaults` never overrides.
 Use this to:
 
 - Centralise the operator's image repository + tag for hermes-agent.
+- Configure the registry pull Secret used by admitted instances.
 - Mandate IRSA / Workload Identity annotations on every ServiceAccount.
 - Mandate a default StorageClass + size for the PVC.
-- Mandate observability (`serviceMonitor.enabled=true`) and networking
-  (`networkPolicy.enabled=true`) without having to repeat them on every
-  instance.
+- Mandate observability (`serviceMonitor.enabled=true`) and
+  `security.networkPolicy.enabled=true` without having to repeat them on
+  every instance.
 
 The CR name **must** be `cluster`. The validating webhook rejects any
 other name with `WrongName` reason.
@@ -28,7 +29,7 @@ kubectl apply -f clusterdefaults.yaml
 kubectl get hcd cluster -o jsonpath='{.status.conditions[?(@.type=="Active")]}'
 # { "status":"True", "reason":"Applied", ... }
 
-# Apply a minimal HermesInstance that omits image, storage, networking:
+# Apply a minimal HermesInstance that omits image, storage, and NetworkPolicy:
 # they will all be filled by the defaults.
 kubectl create namespace agents
 kubectl apply -n agents -f - <<'YAML'
@@ -53,12 +54,12 @@ kubectl get hi defaulted -n agents -o jsonpath='{.spec.image}'
 |---|---|
 | `spec.image.repository` | `ghcr.io/paperclipinc/hermes-agent` |
 | `spec.image.tag` | `1.4.2` |
-| `spec.image.imagePullSecrets[]` | `[{name: ghcr-pull}]` |
+| `spec.registry.pullSecretName` | `ghcr-pull` |
 | `spec.storage.persistence.storageClassName` | `gp3` |
 | `spec.storage.persistence.size` | `10Gi` |
 | `spec.security.serviceAccount.annotations` | `{eks.amazonaws.com/role-arn: arn:aws:iam::...}` |
 | `spec.observability.serviceMonitor.enabled` | `true` |
-| `spec.networking.networkPolicy.enabled` | `true` |
+| `spec.security.networkPolicy.enabled` | `true` |
 
 ## Important: ordering
 
@@ -78,5 +79,5 @@ kubectl delete hcd cluster
 
 Existing `HermesInstance` resources are unaffected (their fields are
 already filled). New ones fall back to the operator's built-in fallback
-defaults (`ghcr.io/paperclipinc/hermes-agent:latest`, 10Gi default StorageClass,
+defaults (`ghcr.io/paperclipinc/hermes-agent:v2026.5.29.2`, 10Gi default StorageClass,
 no SA annotations).
