@@ -1,0 +1,80 @@
+# images/hermes-agent/Dockerfile.local-singlemap
+#
+# TEMPORARY, NON-PRODUCTION Dockerfile for local rootless Podman/docker setups
+# with only a single UID/GID map. It intentionally avoids apt, USER 1000,
+# COPY --chown, chown, chgrp, groupadd, and useradd because those paths require
+# unmapped IDs in this environment.
+#
+# This proves the pinned hermes-agent Python environment, uv availability,
+# venv-template files, and the entrypoint's missing-config behavior. In local
+# sandboxes without GitHub DNS, BASE_IMAGE can be set to a pre-synced builder
+# image that already contains /opt/venv/bin/hermes-agent. It does not prove the
+# production runtime package set: awscli, ffmpeg, ripgrep, zstd, tini, or
+# non-root UID 1000 execution.
+
+ARG BASE_IMAGE=ghcr.io/astral-sh/uv@sha256:17fcaec93ec3414d025d70826fa84f9deab066cd4d63390545d48acbd781b07f
+ARG HERMES_VERSION=v2026.5.29.2
+
+FROM ${BASE_IMAGE} AS runtime
+ARG HERMES_VERSION
+
+ENV UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1 \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    HOME=/home/hermes \
+    HERMES_CONFIG=/home/hermes/.hermes/config.yaml
+
+WORKDIR /build
+
+COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock /opt/venv-template/
+
+RUN set -eux; \
+    if [ -z "${HERMES_VERSION}" ]; then \
+        echo "ERROR: HERMES_VERSION build-arg is required" >&2; exit 1; \
+    fi; \
+    if [ ! -x /opt/venv/bin/hermes-agent ]; then \
+        uv sync --frozen --no-dev; \
+    fi; \
+    mkdir -p /home/hermes/.hermes; \
+    chmod 0755 /home/hermes /home/hermes/.hermes
+
+COPY entrypoint.sh /usr/local/bin/hermes-entrypoint
+RUN chmod 0755 /usr/local/bin/hermes-entrypoint
+
+WORKDIR /home/hermes
+
+LABEL org.opencontainers.image.title="hermes-agent-local-singlemap" \
+      org.opencontainers.image.source="https://github.com/paperclipinc/hermes-operator" \
+      org.opencontainers.image.vendor="paperclipinc" \
+      hermes.agent/version="${HERMES_VERSION}" \
+      hermes.agent/local-singlemap="temporary-non-production"
+
+ENTRYPOINT ["/usr/local/bin/hermes-entrypoint"]
+CMD ["serve"]
+
+FROM runtime AS smoke
+RUN set -eux; \
+    hermes-agent --help >/dev/null; \
+    uv --version; \
+    test -x /opt/venv/bin/hermes-agent; \
+    test -f /opt/venv-template/pyproject.toml; \
+    test -f /opt/venv-template/uv.lock; \
+    for tool in aws ffmpeg rg zstd tini; do \
+        if command -v "${tool}"; then echo "${tool}=present"; else echo "${tool}=missing"; fi; \
+    done; \
+    tar --version >/dev/null; \
+    mktemp --version >/dev/null || mktemp -t hermes.XXXXXX; \
+    set +e; \
+    /usr/local/bin/hermes-entrypoint > /tmp/hermes-entrypoint.out 2>&1; \
+    status="$?"; \
+    set -e; \
+    cat /tmp/hermes-entrypoint.out; \
+    test "${status}" = "78"; \
+    grep -F "hermes-entrypoint: config not readable" /tmp/hermes-entrypoint.out; \
+    rm -rf /tmp/hermes-entrypoint.out /home/hermes/.cache
