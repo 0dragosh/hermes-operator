@@ -74,6 +74,15 @@ func TestBuildMigrationInitContainer_OpenClawRef_Name(t *testing.T) {
 	assert.Equal(t, "ghcr.io/paperclipinc/hermes-agent:1.0.0", c.Image)
 }
 
+func TestBuildMigrationInitContainer_DefaultImageUsesInstanceAgentImageBehavior(t *testing.T) {
+	inst := migrationInstanceWithOpenClawRef()
+	inst.Spec.AutoUpdate.Enabled = true
+	inst.Status.AutoUpdate.TargetTag = "2.0.0"
+	c := BuildMigrationInitContainer(inst)
+	require.NotNil(t, c)
+	assert.Equal(t, "ghcr.io/paperclipinc/hermes-agent:2.0.0", c.Image)
+}
+
 func TestBuildMigrationInitContainer_OpenClawRef_Args(t *testing.T) {
 	c := BuildMigrationInitContainer(migrationInstanceWithOpenClawRef())
 	joined := strings.Join(c.Args, " ")
@@ -95,16 +104,50 @@ func TestBuildMigrationInitContainer_OpenClawRef_VolumeMount(t *testing.T) {
 func TestBuildMigrationInitContainer_S3_DownloadsBeforeMigrate(t *testing.T) {
 	c := BuildMigrationInitContainer(migrationInstanceWithS3())
 	joined := strings.Join(c.Args, " ")
-	assert.Contains(t, joined, "prod/my-openclaw/2026-05-11.tar.zst")
+	assert.Contains(t, joined, `aws --endpoint-url "$OPENCLAW_S3_ENDPOINT_URL"`)
+	assert.Contains(t, joined, `"s3://${OPENCLAW_S3_BUCKET}/${OPENCLAW_S3_KEY}"`)
 	assert.Contains(t, joined, "/mnt/openclaw")
 	assert.Contains(t, joined, "hermes-agent migrate from-openclaw")
+	assert.NotContains(t, joined, "restic")
+	assert.NotContains(t, joined, "openclaw-backups")
+	assert.NotContains(t, joined, "prod/my-openclaw/2026-05-11.tar.zst")
+	assert.NotContains(t, joined, "s3.amazonaws.com")
 }
 
-func TestBuildMigrationInitContainer_S3_EnvFromSecret(t *testing.T) {
+func TestBuildMigrationInitContainer_S3_ExplicitCredentialKeyRefs(t *testing.T) {
 	c := BuildMigrationInitContainer(migrationInstanceWithS3())
-	require.Len(t, c.EnvFrom, 1)
-	require.NotNil(t, c.EnvFrom[0].SecretRef)
-	assert.Equal(t, "oc-s3-creds", c.EnvFrom[0].SecretRef.Name)
+	assert.Empty(t, c.EnvFrom)
+
+	env := containerEnvByName(c)
+	assertSecretKeyRef(t, env["AWS_ACCESS_KEY_ID"], "oc-s3-creds", "S3_ACCESS_KEY_ID")
+	assertSecretKeyRef(t, env["AWS_SECRET_ACCESS_KEY"], "oc-s3-creds", "S3_SECRET_ACCESS_KEY")
+}
+
+func TestBuildMigrationInitContainer_S3_ValuesOnlyInEnv(t *testing.T) {
+	c := BuildMigrationInitContainer(migrationInstanceWithS3())
+	env := containerEnvByName(c)
+	assert.Equal(t, "openclaw-backups", env["OPENCLAW_S3_BUCKET"].Value)
+	assert.Equal(t, "prod/my-openclaw/2026-05-11.tar.zst", env["OPENCLAW_S3_KEY"].Value)
+	assert.Equal(t, "https://s3.amazonaws.com", env["OPENCLAW_S3_ENDPOINT_URL"].Value)
+	assert.Equal(t, "us-east-1", env["AWS_DEFAULT_REGION"].Value)
+}
+
+func TestBuildMigrationInitContainer_VolumeMountsWritableTmp(t *testing.T) {
+	cases := map[string]*hermesv1.HermesInstance{
+		"openclaw ref": migrationInstanceWithOpenClawRef(),
+		"s3 backup":    migrationInstanceWithS3(),
+	}
+	for name, inst := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := BuildMigrationInitContainer(inst)
+			require.NotNil(t, c)
+			found := map[string]string{}
+			for _, m := range c.VolumeMounts {
+				found[m.Name] = m.MountPath
+			}
+			assert.Equal(t, "/tmp", found["tmp"])
+		})
+	}
 }
 
 func TestBuildMigrationInitContainer_CustomImage(t *testing.T) {

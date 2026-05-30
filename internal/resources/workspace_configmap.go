@@ -11,8 +11,7 @@ import (
 )
 
 // InitialDirsKey is the well-known data key holding the newline-separated list
-// of directories to mkdir -p. Stored under a key that cannot collide with any
-// EncodeWorkspacePath output (the "__" prefix is reserved).
+// of directories to mkdir -p.
 const InitialDirsKey = "__hermes_initial_dirs__"
 
 // WorkspaceConfigMapName returns the deterministic name.
@@ -20,30 +19,38 @@ func WorkspaceConfigMapName(inst *hermesv1.HermesInstance) string {
 	return inst.Name + "-workspace"
 }
 
-// EncodeWorkspacePath turns "a/b/c.md" into "a__b__c.md". This is the
-// canonical encoding shared with Plan 3's runtime-init decoder and Plan 4's
-// HermesSelfConfig SSA writer.
+// EncodeWorkspacePath turns a relative path into a ConfigMap-safe key. It
+// escapes "_" before "/" so DecodeWorkspacePath can invert paths containing
+// underscores, including underscores adjacent to path separators.
 func EncodeWorkspacePath(path string) string {
-	return strings.ReplaceAll(path, "/", "__")
+	path = strings.ReplaceAll(path, "_", "_u")
+	return strings.ReplaceAll(path, "/", "_s")
 }
 
 // DecodeWorkspacePath is the inverse of EncodeWorkspacePath.
 func DecodeWorkspacePath(key string) string {
-	return strings.ReplaceAll(key, "__", "/")
+	key = strings.ReplaceAll(key, "_s", "/")
+	return strings.ReplaceAll(key, "_u", "_")
 }
 
-// BuildWorkspaceConfigMap creates the ConfigMap holding spec.workspace.initialFiles
-// (path-encoded into ConfigMap data keys) and spec.workspace.initialDirs (under
-// a single newline-separated key).
-func BuildWorkspaceConfigMap(inst *hermesv1.HermesInstance) *corev1.ConfigMap {
-	data := map[string]string{}
+// BuildWorkspaceConfigMap creates the ConfigMap holding base data,
+// spec.workspace.initialFiles (path-encoded into ConfigMap data keys), and
+// spec.workspace.initialDirs (under a single newline-separated key). Base data
+// is copied first, and spec.workspace.initialFiles wins on key conflicts.
+func BuildWorkspaceConfigMap(inst *hermesv1.HermesInstance, base map[string]string) *corev1.ConfigMap {
+	data := make(map[string]string, len(base)+len(inst.Spec.Workspace.InitialFiles)+1)
+	for k, v := range base {
+		data[k] = v
+	}
 	for _, f := range inst.Spec.Workspace.InitialFiles {
 		data[EncodeWorkspacePath(f.Path)] = f.Content
 	}
-	if len(inst.Spec.Workspace.InitialDirs) > 0 {
-		dirs := make([]string, len(inst.Spec.Workspace.InitialDirs))
-		copy(dirs, inst.Spec.Workspace.InitialDirs)
-		sort.Strings(dirs)
+	dirs := make([]string, len(inst.Spec.Workspace.InitialDirs))
+	copy(dirs, inst.Spec.Workspace.InitialDirs)
+	sort.Strings(dirs)
+	if len(dirs) == 0 {
+		data[InitialDirsKey] = ""
+	} else {
 		data[InitialDirsKey] = strings.Join(dirs, "\n") + "\n"
 	}
 	return &corev1.ConfigMap{

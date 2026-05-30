@@ -34,8 +34,6 @@ func BuildSnapshotJob(inst *hermesv1.HermesInstance, profileID, data string, whe
 
 	rfc3339 := when.UTC().Format(time.RFC3339)
 	relPath := fmt.Sprintf("/data/snapshots/%s/%s.json", profileID, rfc3339)
-	escaped := strings.ReplaceAll(data, "'", `'\''`)
-	cmd := fmt.Sprintf(`set -eu; mkdir -p "$(dirname '%s')"; printf '%%s' '%s' > '%s'`, relPath, escaped, relPath)
 
 	one := int32(1)
 	ttlSeconds := int32(3600)
@@ -56,6 +54,7 @@ func BuildSnapshotJob(inst *hermesv1.HermesInstance, profileID, data string, whe
 					RestartPolicy:                 corev1.RestartPolicyNever,
 					DNSPolicy:                     corev1.DNSClusterFirst,
 					SchedulerName:                 "default-scheduler",
+					AutomountServiceAccountToken:  Ptr(false),
 					TerminationGracePeriodSeconds: Ptr(int64(30)),
 					SecurityContext: &corev1.PodSecurityContext{
 						RunAsNonRoot: Ptr(true),
@@ -67,10 +66,18 @@ func BuildSnapshotJob(inst *hermesv1.HermesInstance, profileID, data string, whe
 						},
 					},
 					Containers: []corev1.Container{{
-						Name:                     "writer",
-						Image:                    "busybox:1.36",
-						ImagePullPolicy:          corev1.PullIfNotPresent,
-						Command:                  []string{"/bin/sh", "-c", cmd},
+						Name:            "writer",
+						Image:           "busybox:1.36",
+						ImagePullPolicy: corev1.PullIfNotPresent,
+						Command:         []string{"/bin/sh", "-c"},
+						Args: []string{`set -eu
+mkdir -p "$(dirname "$SNAPSHOT_PATH")"
+printf '%s' "$SNAPSHOT_DATA" > "$SNAPSHOT_PATH"
+`},
+						Env: []corev1.EnvVar{
+							{Name: "SNAPSHOT_PATH", Value: relPath},
+							{Name: "SNAPSHOT_DATA", Value: data},
+						},
 						TerminationMessagePath:   "/dev/termination-log",
 						TerminationMessagePolicy: corev1.TerminationMessageReadFile,
 						SecurityContext: &corev1.SecurityContext{

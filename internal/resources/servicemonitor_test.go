@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	hermesv1 "github.com/paperclipinc/hermes-operator/api/v1"
@@ -38,7 +39,11 @@ func TestBuildServiceMonitor_Basics(t *testing.T) {
 	assert.Equal(t, "60s", ep["interval"])
 	assert.Equal(t, "20s", ep["scrapeTimeout"])
 	assert.Equal(t, "metrics", ep["port"])
-	assert.Equal(t, "http", ep["scheme"])
+	assert.Equal(t, "https", ep["scheme"])
+	assert.Equal(t, "/var/run/secrets/kubernetes.io/serviceaccount/token", ep["bearerTokenFile"])
+	tlsConfig, ok := ep["tlsConfig"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, true, tlsConfig["insecureSkipVerify"])
 }
 
 func TestBuildServiceMonitor_SecureSchemeMatchesMetricsSecure(t *testing.T) {
@@ -56,6 +61,10 @@ func TestBuildServiceMonitor_SecureSchemeMatchesMetricsSecure(t *testing.T) {
 	spec, _, _ := getNestedMap(sm.Object, "spec")
 	ep := spec["endpoints"].([]interface{})[0].(map[string]interface{})
 	assert.Equal(t, "https", ep["scheme"], "lesson #435: scheme must follow metrics.secure")
+	assert.Equal(t, "/var/run/secrets/kubernetes.io/serviceaccount/token", ep["bearerTokenFile"])
+	tlsConfig, ok := ep["tlsConfig"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, true, tlsConfig["insecureSkipVerify"])
 }
 
 func TestServiceMonitorName(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -102,4 +103,22 @@ func TestBuildService_AddsMetricsPortWhenEnabled(t *testing.T) {
 		}
 	}
 	assert.True(t, sawMetrics, "metrics port emitted when Metrics.Enabled")
+}
+
+func TestBuildService_MetricsPortUsesEffectivePortAndNamedTarget(t *testing.T) {
+	t.Parallel()
+	inst := &hermesv1.HermesInstance{ObjectMeta: metav1.ObjectMeta{Name: "demo"}}
+
+	svc := BuildService(inst)
+	defaultMetrics := servicePortByName(svc.Spec.Ports, MetricsPortName)
+	require.NotNil(t, defaultMetrics)
+	assert.Equal(t, DefaultMetricsPort, defaultMetrics.Port)
+	assert.Equal(t, MetricsPortName, defaultMetrics.TargetPort.StrVal)
+
+	inst.Spec.Observability.Metrics.Port = 9191
+	svc = BuildService(inst)
+	customMetrics := servicePortByName(svc.Spec.Ports, MetricsPortName)
+	require.NotNil(t, customMetrics)
+	assert.Equal(t, int32(9191), customMetrics.Port)
+	assert.Equal(t, MetricsPortName, customMetrics.TargetPort.StrVal)
 }

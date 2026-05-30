@@ -2,6 +2,7 @@ package resources
 
 import (
 	"fmt"
+	"strings"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -9,10 +10,6 @@ import (
 
 	hermesv1 "github.com/paperclipinc/hermes-operator/api/v1"
 )
-
-// ResticImage is the pinned default snapshot-tool image. Mirrors
-// internal/controller.ResticImage (duplicated to keep this package import-cycle free).
-const ResticImage = "restic/restic:0.16.4"
 
 // BackupJobOpts captures the inputs the controller passes to the builder.
 type BackupJobOpts struct {
@@ -22,20 +19,9 @@ type BackupJobOpts struct {
 }
 
 // BuildBackupOneShotJob returns a Job that snapshots the instance PVC to S3.
-// S3 access keys arrive via EnvFrom.SecretRef so they never appear in the PodSpec.
 func BuildBackupOneShotJob(inst *hermesv1.HermesInstance, opts BackupJobOpts) *batchv1.Job {
-	image := inst.Spec.Backup.Image
-	if image == "" {
-		image = ResticImage
-	}
-
+	image := backupImageRef(inst)
 	s3 := inst.Spec.Backup.S3
-	region := ""
-	credSecretName := ""
-	if s3 != nil {
-		region = s3.Region
-		credSecretName = s3.CredentialsSecretRef.Name
-	}
 
 	labels := LabelsForInstance(inst)
 	labels["hermes.agent/job-kind"] = opts.Kind
@@ -45,18 +31,7 @@ func BuildBackupOneShotJob(inst *hermesv1.HermesInstance, opts BackupJobOpts) *b
 
 	args := []string{
 		"-c",
-		fmt.Sprintf(
-			`set -euo pipefail
-META=$(mktemp)
-jq -n --arg uid %q --arg ts "$(date -u +%%Y-%%m-%%dT%%H-%%M-%%SZ)" --arg fmt "1" \
-    '{instance_uid:$uid, hermes_agent_version: env.HERMES_AGENT_VERSION // "", k8s_version: env.K8S_VERSION // "", timestamp:$ts, format_version:($fmt|tonumber)}' > "$META"
-tar --use-compress-program="zstd -T0 -19" -cf - -C /home/hermes/.hermes . "$META" \
-  | restic --repo "$RESTIC_REPOSITORY" --no-cache backup --stdin --stdin-filename %q || \
-{ echo "BACKUP FAILED" >&2; exit 1; }
-`,
-			string(inst.UID),
-			opts.SnapshotKey,
-		),
+		oneShotBackupScript,
 	}
 
 	return &batchv1.Job{
@@ -75,6 +50,7 @@ tar --use-compress-program="zstd -T0 -19" -cf - -C /home/hermes/.hermes . "$META
 					DNSPolicy:                     corev1.DNSClusterFirst,
 					SchedulerName:                 "default-scheduler",
 					TerminationGracePeriodSeconds: Ptr(int64(30)),
+					AutomountServiceAccountToken:  Ptr(false),
 					SecurityContext: &corev1.PodSecurityContext{
 						RunAsNonRoot: Ptr(true),
 						RunAsUser:    Ptr(int64(1000)),
@@ -85,24 +61,20 @@ tar --use-compress-program="zstd -T0 -19" -cf - -C /home/hermes/.hermes . "$META
 						},
 					},
 					Containers: []corev1.Container{{
-						Name:                     "restic",
+						Name:                     "backup",
 						Image:                    image,
 						ImagePullPolicy:          corev1.PullIfNotPresent,
 						Command:                  []string{"/bin/sh"},
 						Args:                     args,
 						TerminationMessagePath:   "/dev/termination-log",
 						TerminationMessagePolicy: corev1.TerminationMessageReadFile,
-						Env: []corev1.EnvVar{
-							{Name: "RESTIC_REPOSITORY", Value: resticRepo(s3)},
-							{Name: "AWS_DEFAULT_REGION", Value: region},
-						},
-						EnvFrom: []corev1.EnvFromSource{{
-							SecretRef: &corev1.SecretEnvSource{
-								LocalObjectReference: corev1.LocalObjectReference{Name: credSecretName},
-							},
-						}},
+						Env: backupS3Env(s3,
+							corev1.EnvVar{Name: "INSTANCE_UID", Value: string(inst.UID)},
+							corev1.EnvVar{Name: "SNAPSHOT_KEY", Value: opts.SnapshotKey},
+						),
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "data", MountPath: "/home/hermes/.hermes"},
+							{Name: "tmp", MountPath: "/tmp"},
 						},
 						SecurityContext: &corev1.SecurityContext{
 							AllowPrivilegeEscalation: Ptr(false),
@@ -110,30 +82,117 @@ tar --use-compress-program="zstd -T0 -19" -cf - -C /home/hermes/.hermes . "$META
 							Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 						},
 					}},
-					Volumes: []corev1.Volume{{
-						Name: "data",
-						VolumeSource: corev1.VolumeSource{
-							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-								ClaimName: PVCName(inst),
+					Volumes: []corev1.Volume{
+						{
+							Name: "data",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: PVCName(inst),
+								},
 							},
 						},
-					}},
+						{
+							Name: "tmp",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
+							},
+						},
+					},
 				},
 			},
 		},
 	}
 }
 
-func resticRepo(s3 *hermesv1.BackupS3Spec) string {
-	if s3 == nil {
-		return ""
+const backupScriptBody = `: "${S3_BUCKET:?}"
+: "${S3_ENDPOINT_URL:?}"
+: "${SNAPSHOT_KEY:?}"
+: "${AWS_ACCESS_KEY_ID:?}"
+: "${AWS_SECRET_ACCESS_KEY:?}"
+: "${AWS_DEFAULT_REGION:-}"
+
+TIMESTAMP="${TIMESTAMP:-$(date -u +%Y-%m-%dT%H-%M-%SZ)}"
+WORKDIR="$(mktemp -d /tmp/hermes-backup.XXXXXX)"
+cleanup() {
+	rm -rf "$WORKDIR"
+}
+trap cleanup EXIT
+
+cat > "$WORKDIR/meta.json" <<EOF
+{"instance_uid":"$INSTANCE_UID","timestamp":"$TIMESTAMP","format_version":1}
+EOF
+tar -C /home/hermes/.hermes -cf "$WORKDIR/hermes.tar" .
+tar -C "$WORKDIR" -rf "$WORKDIR/hermes.tar" meta.json
+zstd -T0 -19 -c "$WORKDIR/hermes.tar" > "$WORKDIR/hermes.tar.zst"
+aws --endpoint-url "$S3_ENDPOINT_URL" s3 cp - "s3://$S3_BUCKET/$SNAPSHOT_KEY" --no-progress < "$WORKDIR/hermes.tar.zst"
+`
+
+const oneShotBackupScript = `set -eu
+` + backupScriptBody
+
+const scheduledBackupScript = `set -eu
+: "${SNAPSHOT_PREFIX:?}"
+TIMESTAMP="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
+SNAPSHOT_KEY="${SNAPSHOT_PREFIX}${TIMESTAMP}.tar.zst"
+export SNAPSHOT_KEY TIMESTAMP
+
+` + backupScriptBody
+
+func backupImageRef(inst *hermesv1.HermesInstance) string {
+	if inst.Spec.Backup.Image != "" {
+		return inst.Spec.Backup.Image
 	}
-	return fmt.Sprintf("s3:%s/%s", s3.Endpoint, s3.Bucket)
+	return imageRef(inst)
 }
 
-func s3CredsSecretName(inst *hermesv1.HermesInstance) string {
-	if inst.Spec.Backup.S3 == nil {
-		return ""
+func backupS3Env(s3 *hermesv1.BackupS3Spec, extra ...corev1.EnvVar) []corev1.EnvVar {
+	bucket := ""
+	endpoint := ""
+	region := ""
+	secretName := ""
+	if s3 != nil {
+		bucket = s3.Bucket
+		endpoint = normalizedEndpointURL(s3.Endpoint)
+		region = s3.Region
+		secretName = s3.CredentialsSecretRef.Name
 	}
-	return inst.Spec.Backup.S3.CredentialsSecretRef.Name
+	env := []corev1.EnvVar{
+		{Name: "S3_BUCKET", Value: bucket},
+		{Name: "S3_ENDPOINT_URL", Value: endpoint},
+		{Name: "AWS_DEFAULT_REGION", Value: region},
+		{
+			Name: "AWS_ACCESS_KEY_ID",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+					Key:                  "S3_ACCESS_KEY_ID",
+				},
+			},
+		},
+		{
+			Name: "AWS_SECRET_ACCESS_KEY",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+					Key:                  "S3_SECRET_ACCESS_KEY",
+				},
+			},
+		},
+	}
+	return append(env, extra...)
+}
+
+func backupObjectPrefix(inst *hermesv1.HermesInstance) string {
+	prefix := ""
+	if inst.Spec.Backup.S3 != nil {
+		prefix = inst.Spec.Backup.S3.PathPrefix
+		if prefix != "" && !strings.HasSuffix(prefix, "/") {
+			prefix += "/"
+		}
+	}
+	return fmt.Sprintf("%s%s/%s/", prefix, inst.Namespace, inst.Name)
+}
+
+func failedBackupObjectPrefix(inst *hermesv1.HermesInstance) string {
+	return backupObjectPrefix(inst) + "failed/"
 }

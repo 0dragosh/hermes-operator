@@ -114,10 +114,17 @@ func BuildHonchoDeployment(inst *hermesv1.HermesInstance) *appsv1.Deployment {
 		{Name: "honcho-data", MountPath: "/data"},
 		{Name: "tmp", MountPath: "/tmp"},
 	}
-	volumes := []corev1.Volume{
-		{Name: "honcho-data", VolumeSource: corev1.VolumeSource{
+	honchoDataVolume := corev1.Volume{
+		Name: "honcho-data",
+		VolumeSource: corev1.VolumeSource{
 			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: HonchoPVCName(inst)},
-		}},
+		},
+	}
+	if !BoolValueOrDefault(h.Persistence.Enabled, true) {
+		honchoDataVolume.VolumeSource = corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}
+	}
+	volumes := []corev1.Volume{
+		honchoDataVolume,
 		{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 	}
 

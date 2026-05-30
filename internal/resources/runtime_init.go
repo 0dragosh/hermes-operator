@@ -10,13 +10,52 @@ import (
 	hermesv1 "github.com/paperclipinc/hermes-operator/api/v1"
 )
 
+const workspaceBootstrapScript = `set -eu
+DATA_DIR="${HERMES_DATA_DIR:?}"
+SEED_DIR="${HERMES_WORKSPACE_SEED_DIR:?}"
+DIRS_KEY="${HERMES_INITIAL_DIRS_KEY:?}"
+SENTINEL="${HERMES_BOOTSTRAP_SENTINEL:?}"
+
+mkdir -p "$DATA_DIR"
+if [ -e "$SENTINEL" ]; then
+  exit 0
+fi
+
+if [ -f "$SEED_DIR/$DIRS_KEY" ]; then
+  while IFS= read -r rel_dir || [ -n "$rel_dir" ]; do
+    [ -n "$rel_dir" ] || continue
+    case "$rel_dir" in
+      /*|.|..|../*|*/../*|*/..) echo "refusing unsafe initial dir: $rel_dir" >&2; exit 1 ;;
+    esac
+    mkdir -p "$DATA_DIR/$rel_dir"
+  done < "$SEED_DIR/$DIRS_KEY"
+fi
+
+for src in "$SEED_DIR"/* "$SEED_DIR"/.[!.]* "$SEED_DIR"/..?*; do
+  [ -e "$src" ] || continue
+  [ -f "$src" ] || continue
+  name="$(basename "$src")"
+  [ "$name" != "$DIRS_KEY" ] || continue
+  dest_rel="$(printf '%s' "$name" | sed 's#_s#/#g; s#_u#_#g')"
+  case "$dest_rel" in
+    /*|.|..|../*|*/../*|*/..) echo "refusing unsafe seed path: $dest_rel" >&2; exit 1 ;;
+  esac
+  mkdir -p "$(dirname "$DATA_DIR/$dest_rel")"
+  cp "$src" "$DATA_DIR/$dest_rel"
+done
+
+hermes onboard
+touch "$SENTINEL"
+`
+
 // BuildRuntimeInitContainers returns the ordered init containers required by
-// spec.runtime. Order: init-apt → init-uv → init-pip. Each container mounts the
-// full data volume (no subPath, lesson openclaw #450).
+// workspace bootstrap and spec.runtime. Order: init-workspace-bootstrap,
+// init-uv, init-pip. Each container mounts the full data volume (no subPath,
+// lesson openclaw #450).
 func BuildRuntimeInitContainers(inst *hermesv1.HermesInstance) []corev1.Container {
 	var out []corev1.Container
-	if len(inst.Spec.Runtime.ExtraAptPackages) > 0 {
-		out = append(out, buildAptInit(inst))
+	if bootstrapEnabled(inst) {
+		out = append(out, buildWorkspaceBootstrapInit(inst))
 	}
 	if uvEnabled(inst) {
 		out = append(out, buildUVSyncInit(inst))
@@ -30,7 +69,7 @@ func BuildRuntimeInitContainers(inst *hermesv1.HermesInstance) []corev1.Containe
 // BuildRuntimeVolumes returns additional Volumes beyond data PVC + config CM.
 func BuildRuntimeVolumes(inst *hermesv1.HermesInstance) []corev1.Volume {
 	var out []corev1.Volume
-	if !uvEnabled(inst) {
+	if !uvCacheNeeded(inst) {
 		return out
 	}
 	cache := inst.Spec.Runtime.UV.CacheVolume
@@ -66,6 +105,14 @@ func uvEnabled(inst *hermesv1.HermesInstance) bool {
 	return *inst.Spec.Runtime.UV.Enabled
 }
 
+func uvCacheNeeded(inst *hermesv1.HermesInstance) bool {
+	return uvEnabled(inst) || len(inst.Spec.Runtime.ExtraPipPackages) > 0
+}
+
+func bootstrapEnabled(inst *hermesv1.HermesInstance) bool {
+	return BoolValue(inst.Spec.Workspace.Bootstrap.Enabled)
+}
+
 func dataVolumeMount() corev1.VolumeMount {
 	return corev1.VolumeMount{Name: "data", MountPath: "/home/hermes/.hermes"}
 }
@@ -97,32 +144,36 @@ func buildUVSyncInit(inst *hermesv1.HermesInstance) corev1.Container {
 		VolumeMounts: []corev1.VolumeMount{
 			dataVolumeMount(),
 			{Name: "uv-cache", MountPath: "/home/hermes/.cache/uv"},
+			{Name: "tmp", MountPath: "/tmp"},
 		},
 	}
 }
 
-func buildAptInit(inst *hermesv1.HermesInstance) corev1.Container {
-	pkgs := strings.Join(quoteEach(inst.Spec.Runtime.ExtraAptPackages), " ")
-	cmd := fmt.Sprintf(
-		"set -eu; apt-get update; apt-get install -y --no-install-recommends %s; rm -rf /var/lib/apt/lists/*",
-		pkgs,
-	)
+func buildWorkspaceBootstrapInit(inst *hermesv1.HermesInstance) corev1.Container {
 	return corev1.Container{
-		Name:                     "init-apt",
+		Name:                     "init-workspace-bootstrap",
 		Image:                    imageRef(inst),
 		ImagePullPolicy:          pullPolicy(inst),
-		Command:                  []string{"/bin/sh", "-c", cmd},
+		Command:                  []string{"/bin/sh", "-c", workspaceBootstrapScript},
 		TerminationMessagePath:   "/dev/termination-log",
 		TerminationMessagePolicy: corev1.TerminationMessageReadFile,
+		Env: []corev1.EnvVar{
+			{Name: "HERMES_DATA_DIR", Value: "/home/hermes/.hermes"},
+			{Name: "HERMES_WORKSPACE_SEED_DIR", Value: "/home/hermes/.hermes-workspace-seed"},
+			{Name: "HERMES_INITIAL_DIRS_KEY", Value: InitialDirsKey},
+			{Name: "HERMES_BOOTSTRAP_SENTINEL", Value: "/home/hermes/.hermes/.bootstrap-complete"},
+		},
 		SecurityContext: &corev1.SecurityContext{
-			RunAsNonRoot:             Ptr(false),
-			RunAsUser:                Ptr(int64(0)),
+			RunAsNonRoot:             Ptr(true),
+			RunAsUser:                Ptr(int64(1000)),
 			AllowPrivilegeEscalation: Ptr(false),
-			ReadOnlyRootFilesystem:   Ptr(false),
-			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}, Add: []corev1.Capability{"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID", "SETGID"}},
+			ReadOnlyRootFilesystem:   Ptr(true),
+			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 		},
 		VolumeMounts: []corev1.VolumeMount{
 			dataVolumeMount(),
+			{Name: "workspace", MountPath: "/home/hermes/.hermes-workspace-seed", ReadOnly: true},
+			{Name: "tmp", MountPath: "/tmp"},
 		},
 	}
 }
@@ -151,6 +202,7 @@ func buildPipInit(inst *hermesv1.HermesInstance) corev1.Container {
 		VolumeMounts: []corev1.VolumeMount{
 			dataVolumeMount(),
 			{Name: "uv-cache", MountPath: "/home/hermes/.cache/uv"},
+			{Name: "tmp", MountPath: "/tmp"},
 		},
 	}
 }
