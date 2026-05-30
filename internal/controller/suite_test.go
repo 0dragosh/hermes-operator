@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	hermesv1 "github.com/paperclipinc/hermes-operator/api/v1"
 	"github.com/paperclipinc/hermes-operator/internal/oci"
@@ -91,7 +92,8 @@ var _ = BeforeSuite(func() {
 	// Set up the controller manager and register the reconciler so BDD specs can
 	// rely on the controller running in the background.
 	k8sManager, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme: scheme.Scheme,
+		Scheme:  scheme.Scheme,
+		Metrics: metricsserver.Options{BindAddress: "0"},
 	})
 	Expect(err).ToNot(HaveOccurred())
 
@@ -123,6 +125,7 @@ var _ = BeforeSuite(func() {
 
 	err = (&HermesInstanceReconciler{
 		Client:                        k8sManager.GetClient(),
+		APIReader:                     k8sManager.GetAPIReader(),
 		Scheme:                        k8sManager.GetScheme(),
 		PrometheusOperatorCRDsPresent: false,
 		Recorder:                      k8sManager.GetEventRecorderFor("hermes-operator"),
